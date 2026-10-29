@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BBOX = (34.5, -90.9, 37.2, -81.0)
 
+DEFAULT_USER_AGENT = "CrazyMapsDollarGeneralFinder/1.0 (https://github.com/crazy-maps)"
+
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
@@ -91,7 +93,7 @@ def fetch_tn_boundary(cache_path: Path | str, refresh: bool = False) -> shapely.
     for url in TN_BOUNDARY_URLS:
         try:
             logger.info("Fetching Tennessee boundary from %s", url)
-            resp = requests.get(url, timeout=30)
+            resp = requests.get(url, headers={"User-Agent": DEFAULT_USER_AGENT}, timeout=30)
             resp.raise_for_status()
             data = resp.json()
             geom = parse_boundary_geojson(data)
@@ -310,7 +312,12 @@ def fetch_dollar_generals(
     for endpoint in OVERPASS_ENDPOINTS:
         try:
             logger.info("Querying Overpass API at %s", endpoint)
-            resp = requests.post(endpoint, data={"data": query}, timeout=180)
+            resp = requests.post(
+                endpoint,
+                data={"data": query},
+                headers={"User-Agent": DEFAULT_USER_AGENT},
+                timeout=180,
+            )
             resp.raise_for_status()
             res_json = resp.json()
             if "elements" not in res_json:

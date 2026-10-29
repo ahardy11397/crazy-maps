@@ -11,6 +11,9 @@ from tn_dollar_general.geometry import (
     find_furthest_point,
     geodesic_circle_coords,
 )
+from tn_dollar_general.map_builder import (
+    build_map,
+)
 
 __all__ = [
     "StoreRecord",
@@ -22,5 +25,5 @@ __all__ = [
     "FurthestPointResult",
     "find_furthest_point",
     "geodesic_circle_coords",
+    "build_map",
 ]
-
