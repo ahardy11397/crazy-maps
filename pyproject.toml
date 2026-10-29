@@ -1,0 +1,26 @@
+[project]
+name = "crazy-maps"
+version = "0.1.0"
+description = "Tennessee Dollar General Map & Furthest Point Finder"
+requires-python = ">=3.11"
+dependencies = [
+    "shapely>=2.0",
+    "scipy>=1.11",
+    "pyproj>=3.6",
+    "folium>=0.15",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
