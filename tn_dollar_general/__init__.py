@@ -5,6 +5,12 @@ from tn_dollar_general.data_fetcher import (
     parse_and_deduplicate_overpass,
     fetch_dollar_generals,
 )
+from tn_dollar_general.geometry import (
+    NearestStoreInfo,
+    FurthestPointResult,
+    find_furthest_point,
+    geodesic_circle_coords,
+)
 
 __all__ = [
     "StoreRecord",
@@ -12,4 +18,9 @@ __all__ = [
     "fetch_tn_boundary",
     "parse_and_deduplicate_overpass",
     "fetch_dollar_generals",
+    "NearestStoreInfo",
+    "FurthestPointResult",
+    "find_furthest_point",
+    "geodesic_circle_coords",
 ]
+
