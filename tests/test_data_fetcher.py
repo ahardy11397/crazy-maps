@@ -20,6 +20,11 @@ def test_tn_boundary_urls_lead_with_census_500k():
     assert all("wiki/files" not in url for url in TN_BOUNDARY_URLS)
 
 
+def square_geom_fixture():
+    # Same tiny square TN geometry used inline by the neighboring parse tests.
+    return box(-87.0, 35.0, -85.0, 36.5)
+
+
 def test_parse_boundary_handles_feature_collection_and_multipolygon():
     poly1 = box(-86.0, 35.0, -85.0, 36.0)
     poly2 = box(-87.0, 35.0, -86.5, 35.5)
@@ -161,6 +166,55 @@ def test_fetch_dollar_generals_cache_hit(tmp_path: Path):
         assert stores[0].name == "Dollar General Cached"
         assert stores[0].city == "Nashville"
         assert mock_post.call_count == 0
+
+
+def test_parse_captures_housenumber_and_postcode():
+    elements = [{
+        "type": "node", "id": 10, "lat": 35.0, "lon": -86.0,
+        "tags": {"name": "Dollar General", "addr:street": "Main St",
+                 "addr:housenumber": "707", "addr:postcode": "38104"},
+    }]
+    rec = parse_and_deduplicate_overpass(elements, square_geom_fixture())[0]
+    assert rec.housenumber == "707"
+    assert rec.postcode == "38104"
+
+
+def test_cache_roundtrip_persists_housenumber_and_postcode(tmp_path, monkeypatch):
+    tn_geom = square_geom_fixture()
+    cache_file = tmp_path / "cache.geojson"
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {
+        "elements": [{
+            "type": "node", "id": 10, "lat": 35.5, "lon": -86.0,
+            "tags": {"name": "Dollar General", "addr:street": "Main St",
+                     "addr:housenumber": "707", "addr:postcode": "38104"},
+        }]
+    }
+    monkeypatch.setattr("tn_dollar_general.data_fetcher.requests.post", lambda *args, **kwargs: resp)
+    stores = fetch_dollar_generals(tn_geom, cache_file, refresh=True)
+    assert len(stores) == 1
+    # Second call loads from the GeoJSON cache on disk.
+    reloaded = fetch_dollar_generals(tn_geom, cache_file, refresh=False)
+    assert reloaded[0].housenumber == stores[0].housenumber
+    assert reloaded[0].postcode == stores[0].postcode
+    assert reloaded[0].housenumber == "707"
+    assert reloaded[0].postcode == "38104"
+
+
+def test_dedup_merge_fills_housenumber_from_colocated_duplicate():
+    # node + way for the same store within 50 m: node has addr:street, the
+    # way also has addr:housenumber; kept record must gain the housenumber.
+    tn_geom = square_geom_fixture()
+    elements = [
+        {"type": "node", "id": 1, "lat": 35.5, "lon": -86.0,
+         "tags": {"name": "Dollar General", "addr:street": "Main St", "addr:state": "TN"}},
+        {"type": "way", "id": 2, "center": {"lat": 35.5, "lon": -86.00035},
+         "tags": {"name": "Dollar General", "building": "retail", "addr:housenumber": "707"}},
+    ]
+    stores = parse_and_deduplicate_overpass(elements, tn_geom, dedup_distance_m=50.0)
+    assert len(stores) == 1
+    assert stores[0].street == "Main St"      # kept from the node
+    assert stores[0].housenumber == "707"     # filled from the suppressed way
 
 
 def test_fetch_tn_boundary_caching_and_download(tmp_path: Path):

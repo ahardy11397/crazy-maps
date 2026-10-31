@@ -45,6 +45,8 @@ class StoreRecord:
     street: str | None
     state: str | None
     in_tn: bool
+    housenumber: str | None = None
+    postcode: str | None = None
 
 
 def parse_boundary_geojson(geojson_data: dict) -> shapely.Geometry:
@@ -179,6 +181,8 @@ def parse_and_deduplicate_overpass(
         city = tags.get("addr:city")
         street = tags.get("addr:street")
         state = tags.get("addr:state")
+        housenumber = tags.get("addr:housenumber")
+        postcode = tags.get("addr:postcode")
 
         score = _tag_richness_score(tags)
         candidates.append({
@@ -189,6 +193,8 @@ def parse_and_deduplicate_overpass(
             "city": city,
             "street": street,
             "state": state,
+            "housenumber": housenumber,
+            "postcode": postcode,
             "score": score,
         })
 
@@ -209,6 +215,8 @@ def parse_and_deduplicate_overpass(
                 street=c["street"],
                 state=state,
                 in_tn=in_tn,
+                housenumber=c["housenumber"],
+                postcode=c["postcode"],
             )
         ]
 
@@ -239,6 +247,10 @@ def parse_and_deduplicate_overpass(
                     candidates[idx]["street"] = n_cand["street"]
                 if not candidates[idx]["state"] and n_cand["state"]:
                     candidates[idx]["state"] = n_cand["state"]
+                if not candidates[idx]["housenumber"] and n_cand["housenumber"]:
+                    candidates[idx]["housenumber"] = n_cand["housenumber"]
+                if not candidates[idx]["postcode"] and n_cand["postcode"]:
+                    candidates[idx]["postcode"] = n_cand["postcode"]
 
     kept_indices.sort()
 
@@ -257,6 +269,8 @@ def parse_and_deduplicate_overpass(
                 street=c["street"],
                 state=state,
                 in_tn=in_tn,
+                housenumber=c["housenumber"],
+                postcode=c["postcode"],
             )
         )
 
@@ -292,6 +306,8 @@ def fetch_dollar_generals(
                         street=props.get("street"),
                         state=props.get("state"),
                         in_tn=bool(props.get("in_tn", False)),
+                        housenumber=props.get("housenumber"),
+                        postcode=props.get("postcode"),
                     )
                 )
             return records
@@ -345,6 +361,8 @@ def fetch_dollar_generals(
                             "street": s.street,
                             "state": s.state,
                             "in_tn": s.in_tn,
+                            "housenumber": s.housenumber,
+                            "postcode": s.postcode,
                         },
                     }
                     for s in stores
