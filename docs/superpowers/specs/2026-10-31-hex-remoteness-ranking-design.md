@@ -22,7 +22,7 @@ The user's core need: follow the news about a town / be curious about a spot, cl
 
 | Choice | Value |
 |---|---|
-| Hexagon size | **1 km across**, yielding roughly 42,000 hexes whose centers lie inside Tennessee |
+| Hexagon size | **1 km across (across-flats)**, yielding roughly 125,000 hexes whose centers lie inside Tennessee |
 | Rank direction | **#1 = most remote**; ranks descend toward the store-dense areas |
 | Metric | Straight-line distance, in **miles**, from hexagon center to nearest DG center |
 | Palette | **Single-hue blue scale** — pale blue where stores crowd in, deep navy in emptiest regions |
@@ -74,7 +74,7 @@ tests/
 
 ### 5.1 Hex grid & ranking (`hexgrid.py`)
 - Anchored on the TN extent in EPSG:6575; flat-top hexagons with **1 km across-flats** (`spacing ≈ 1 km` center-to-center horizontally, ~1.155 km row pitch — builder picks exact axial scheme; not load-bearing).
-- Keep only hexes whose **center** is inside `tn_geom` (shapely `contains`, prepared). Target order of magnitude: ~42,000.
+- Keep only hexes whose **center** is inside `tn_geom` (shapely `contains`, prepared). Target order of magnitude: ~125,000 (flat-top hexes, across-flats 1 km → 0.866 km² each).
 - Distances: `cKDTree` on projected store coords, one `query(k=1)` over all centers (trivial compute).
 - **Ranks:** sort by distance descending → rank 1..N. Equal distances broken deterministically (hex-index ascending). Nearest store id stored with each hex for card display.
 - Exposed dataclass `HexRanking` carrying: arrays (center lat/lon, distance_meters, rank, store_idx), the axial-coordinate mapping (for click lookup), and Neighbor Table by rank (rank-1, rank+1).
@@ -85,8 +85,8 @@ tests/
 - All address fields flow to the front-end per store.
 
 ### 5.3 Map layer (`map_builder.py`)
-- **Raster overlay:** build renders ONE PNG of the whole hex field (matplotlib `PolyCollection`/`pcolormesh`, ≤ ~2 MB), colors from the single-hue blue ramp (`0 mi → lightest, #1 → deepest navy`), projected bounds handed to `folium.raster_layers.ImageOverlay`. **Only one image, zero vector hexes in SVG/GeoJSON.**
-- **Click math:** embedded compact data block — per hex: distance (uint16, 0.01 mi units), rank (delta-encoded uint16), nearest store index (uint16) ≈ 6 B/hex ≈ **~250 KB** — base64 in the HTML, decoded into typed arrays. Clicked `(lat, lon)` → EPSG:6575 → axial hex id → array lookup: O(1), pure math.
+- **Raster overlay:** build renders ONE PNG of the whole hex field (matplotlib `PolyCollection`/`pcolormesh`, ≤ ~6 MB), colors from the single-hue blue ramp (`0 mi → lightest, #1 → deepest navy`), projected bounds handed to `folium.raster_layers.ImageOverlay`. **Only one image, zero vector hexes in SVG/GeoJSON.**
+- **Click math:** embedded compact data block — per hex: distance (uint16, 0.001 mi units), rank order (uint32), nearest store index (uint32), quantized center lat/lon (uint16 pair) ≈ 14 B/hex ≈ **~1 MB** — base64 in the HTML, decoded into typed arrays. Clicked `(lat, lon)` → WGS84 bucket lookup (precomputed nearest-hex grid) → array lookup: O(1), pure math, no projection code needed in JS.
 - **Side rail UI** (*owner call 2026-10-31*): the rail **reserves its own column beside the map** (viewport shrinks, map DOM resized in a flex wrapper) so the map is never *obscured* — it stays fully visible, and the existing floating info card keeps its home. Rail: (a) 3-card "remoteness podium" per §2, (b) **Top 10 tab** listing most-remote hexes with rank/distance/nearest DG and a `jump to map` action that pans/zooms and pulses a highlight overlay of that one hexagon (a vector heptagon for 10 hexes is fine).
 - **Click highlight** (*owner call*): one ephemeral vector hexagon — outline drawn dynamically at click time on the clicked (or snapped) hex, removed on the next click. Baked anti-goal targets pre-rendered hexes only; this lives in a dedicated empty-at-build layer.
 - **Border clicks** (*owner call*): a click inside TN with no ranked hex underneath (near-border gaps in the center-inside-TN set) **snaps to the nearest ranked hex**; clicks entirely off-state leave the rail untouched.
