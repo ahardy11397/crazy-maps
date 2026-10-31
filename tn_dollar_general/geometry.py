@@ -51,27 +51,77 @@ def geodesic_circle_coords(
     return [(float(lt), float(ln)) for ln, lt in zip(lons, lats)]
 
 
-def find_furthest_point(
+def verify_furthest_point(
     tn_geom: shapely.Geometry,
     stores: list[StoreRecord],
-    grid_step_m: float = 2000.0,
-) -> FurthestPointResult:
-    """Find the exact point inside tn_geom furthest from any Dollar General store.
+    result: FurthestPointResult,
+    grid_step_m: float = 1000.0,
+    tolerance_m: float = 100.0,
+) -> bool:
+    """Verify (spec 4.3) that no point on a dense verification grid inside tn_geom
+    has a greater distance to any store than the reported optimum.
 
-    Uses planar projection EPSG:6576 (NAD83(2011) / Tennessee) for candidate generation
-    (interior Voronoi vertices, Voronoi ridge-boundary intersections, boundary vertices,
-    dense boundary samples, and an interior grid), then refines top candidates using
-    Nelder-Mead optimization on the exact WGS84 geodesic distance.
+    Uses the planar EPSG:6575 projection and a KDTree over the store positions as
+    a fast proxy for the exact WGS84 geodesic distance; tolerance_m absorbs the
+    projection-vs-geodesic discrepancy (order of 1:10,000 within Tennessee, i.e.
+    a few meters per distance evaluation). Returns True when the reported optimum
+    holds across the grid.
     """
     if not stores:
         raise ValueError("stores list cannot be empty")
     if tn_geom.is_empty:
         raise ValueError("tn_geom cannot be empty")
 
-    to_proj = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:6576", always_xy=True)
-    to_wgs84 = pyproj.Transformer.from_crs("EPSG:6576", "EPSG:4326", always_xy=True)
+    to_proj = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:6575", always_xy=True)
+    store_lons = np.array([s.lon for s in stores], dtype=float)
+    store_lats = np.array([s.lat for s in stores], dtype=float)
+    s_xs, s_ys = to_proj.transform(store_lons, store_lats)
+    store_xy = np.column_stack([s_xs, s_ys])
 
-    # Project geometry to planar EPSG:6576
+    tn_geom_proj = shapely.transform(
+        tn_geom,
+        lambda coords: np.column_stack(to_proj.transform(coords[:, 0], coords[:, 1])),
+    )
+
+    minx, miny, maxx, maxy = tn_geom_proj.bounds
+    step = max(grid_step_m, 100.0)
+    xs = np.arange(minx, maxx, step)
+    ys = np.arange(miny, maxy, step)
+    gx, gy = np.meshgrid(xs, ys)
+    grid = np.column_stack([gx.ravel(), gy.ravel()])
+    pts = shapely.points(grid[:, 0], grid[:, 1])
+    inside = shapely.covers(tn_geom_proj, pts)
+    grid = grid[inside]
+    if len(grid) == 0:
+        return True
+
+    tree = scipy.spatial.KDTree(store_xy)
+    planar_max, _ = tree.query(grid, k=1)
+    return bool(float(np.max(planar_max)) <= result.distance_meters + tolerance_m)
+
+
+def find_furthest_point(
+    tn_geom: shapely.Geometry,
+    stores: list[StoreRecord],
+    grid_step_m: float = 1000.0,
+) -> FurthestPointResult:
+    """Find the exact point inside tn_geom furthest from any Dollar General store.
+
+    Uses planar projection EPSG:6575 (NAD83(2011) / Tennessee) for candidate generation
+    (interior Voronoi vertices, Voronoi ridge-boundary intersections, boundary vertices,
+    dense boundary samples, and a 1 km interior verification grid per the spec), then
+    refines top candidates using Nelder-Mead optimization on the exact WGS84 geodesic
+    distance. The reported optimum is audited with verify_furthest_point before return.
+    """
+    if not stores:
+        raise ValueError("stores list cannot be empty")
+    if tn_geom.is_empty:
+        raise ValueError("tn_geom cannot be empty")
+
+    to_proj = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:6575", always_xy=True)
+    to_wgs84 = pyproj.Transformer.from_crs("EPSG:6575", "EPSG:4326", always_xy=True)
+
+    # Project geometry to planar EPSG:6575
     tn_geom_proj = shapely.transform(
         tn_geom,
         lambda coords: np.column_stack(to_proj.transform(coords[:, 0], coords[:, 1])),
@@ -310,7 +360,9 @@ def find_furthest_point(
             )
         )
 
-    return FurthestPointResult(
+    # Grid-verification audit (spec 4.3): no point on a dense verification grid
+    # across the region may have a greater distance to any store than the reported optimum.
+    result = FurthestPointResult(
         lat=float(best_lat),
         lon=float(best_lon),
         distance_meters=max_distance_meters,
@@ -318,3 +370,9 @@ def find_furthest_point(
         distance_miles=max_distance_meters / METERS_PER_MILE,
         nearest_stores=nearest_stores,
     )
+    if not verify_furthest_point(tn_geom, stores, result, grid_step_m=grid_step_m):
+        logger.warning(
+            "Verification grid found a candidate exceeding the reported optimum; "
+            "results may be approximate in this region (check boundary resolution and store coverage)."
+        )
+    return result

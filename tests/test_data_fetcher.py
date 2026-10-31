@@ -4,11 +4,20 @@ import json
 from shapely.geometry import box, MultiPolygon, Polygon
 from tn_dollar_general.data_fetcher import (
     StoreRecord,
+    TN_BOUNDARY_URLS,
     parse_boundary_geojson,
     parse_and_deduplicate_overpass,
     fetch_dollar_generals,
     fetch_tn_boundary,
 )
+
+
+def test_tn_boundary_urls_lead_with_census_500k():
+    # Census 1:500k boundary is the high-resolution source required by the spec;
+    # it must be tried first, and the dead 'wiki/files' URL path must not remain.
+    assert "eric.clst.org" in TN_BOUNDARY_URLS[0]
+    assert "gz_2010_us_040_00_500k.json" in TN_BOUNDARY_URLS[0]
+    assert all("wiki/files" not in url for url in TN_BOUNDARY_URLS)
 
 
 def test_parse_boundary_handles_feature_collection_and_multipolygon():
@@ -59,6 +68,36 @@ def test_parse_overpass_empty_and_invalid():
         {"type": "node", "id": 3, "lat": 35.5, "lon": -86.0, "tags": {"name": "Walmart"}},
     ]
     assert parse_and_deduplicate_overpass(bad_elements, tn_box) == []
+
+
+def test_parse_assigns_typed_osm_ids_for_links():
+    # IDs must carry their OSM element type so popup links resolve on openstreetmap.org
+    tn_box = box(-87.0, 35.0, -85.0, 36.5)
+    elements = [
+        {"type": "node", "id": 7, "lat": 35.6, "lon": -86.1, "tags": {"name": "Dollar General"}},
+        {"type": "way", "id": 42, "center": {"lat": 35.2, "lon": -85.7}, "tags": {"brand": "Dollar General"}},
+        {
+            "type": "relation",
+            "id": 99,
+            "center": {"lat": 36.0, "lon": -85.4},
+            "tags": {"brand:wikidata": "Q145168", "name": "Dollar General"},
+        },
+    ]
+    stores = parse_and_deduplicate_overpass(elements, tn_box)
+    assert len(stores) == 3
+    assert {s.id for s in stores} == {"node/7", "way/42", "relation/99"}
+
+
+def test_dedup_radius_is_50_meters_not_feet():
+    # Spec says deduplication within 50 m; EPSG:6576 was US feet (50 ft = 15 m),
+    # so two representations ~30 m apart must collapse into one store.
+    tn_box = box(-87.0, 35.0, -85.0, 36.5)
+    elements = [
+        {"type": "node", "id": 1, "lat": 35.5, "lon": -86.0, "tags": {"name": "Dollar General", "addr:city": "M"}},
+        {"type": "way", "id": 2, "center": {"lat": 35.5, "lon": -86.00035}, "tags": {"name": "Dollar General"}},
+    ]
+    stores = parse_and_deduplicate_overpass(elements, tn_box, dedup_distance_m=50.0)
+    assert len(stores) == 1
 
 
 def test_parse_overpass_relation_and_wikidata():

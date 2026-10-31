@@ -1,3 +1,4 @@
+import inspect
 import math
 import pytest
 from shapely.geometry import box, MultiPolygon, Polygon
@@ -8,6 +9,7 @@ from tn_dollar_general.geometry import (
     geodesic_circle_coords,
     FurthestPointResult,
     NearestStoreInfo,
+    verify_furthest_point,
 )
 
 GEOD = Geod(ellps="WGS84")
@@ -84,6 +86,50 @@ def test_empty_stores_or_geom_raises_value_error():
     empty_poly = Polygon()
     with pytest.raises(ValueError, match="geom"):
         find_furthest_point(empty_poly, [_make_store(1, 35.8, -86.0)])
+
+
+def test_default_grid_step_is_1km_verification_grid():
+    # Spec 4.1: candidates include a uniform 1 km verification grid for global coverage
+    param = inspect.signature(find_furthest_point).parameters["grid_step_m"]
+    assert param.default == pytest.approx(1000.0)
+
+
+def test_verify_furthest_point_flags_understated_distance():
+    # Spec 4.3: no point on a dense verification grid may have a greater distance
+    # to any store than the reported optimum
+    poly = box(-86.1, 35.7, -85.9, 35.9)
+    stores = [
+        _make_store(1, 35.7, -86.1),
+        _make_store(2, 35.7, -85.9),
+        _make_store(3, 35.9, -86.1),
+        _make_store(4, 35.9, -85.9),
+    ]
+    lat, lon = 35.8, -86.0
+    dists = []
+    for s in stores:
+        _, _, d = GEOD.inv(lon, lat, s.lon, s.lat)
+        dists.append(float(d))
+    true_min = min(dists)
+
+    understated = FurthestPointResult(
+        lat=lat,
+        lon=lon,
+        distance_meters=true_min - 500.0,
+        distance_km=(true_min - 500.0) / 1000.0,
+        distance_miles=(true_min - 500.0) / 1609.344,
+        nearest_stores=[],
+    )
+    assert verify_furthest_point(poly, stores, understated, grid_step_m=1000.0) is False
+
+    exact = FurthestPointResult(
+        lat=lat,
+        lon=lon,
+        distance_meters=true_min,
+        distance_km=true_min / 1000.0,
+        distance_miles=true_min / 1609.344,
+        nearest_stores=[],
+    )
+    assert verify_furthest_point(poly, stores, exact, grid_step_m=1000.0) is True
 
 
 def test_result_units_consistency():

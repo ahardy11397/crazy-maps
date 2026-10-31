@@ -13,6 +13,20 @@ from tn_dollar_general.geometry import FurthestPointResult, geodesic_circle_coor
 logger = logging.getLogger(__name__)
 
 
+def _safe_tooltip(text: str) -> str:
+    """Sanitize text for use as a folium Tooltip label.
+
+    folium's Tooltip template interpolates the text raw into a JS template
+    literal inside a <script> block (and Leaflet inserts the rendered span
+    via innerHTML), so HTML payloads, backticks, and ${...} interpolation
+    must all be neutralized. Entities are decoded when Leaflet hydrates the
+    tooltip, so the visible text is unaffected.
+    """
+    escaped = html.escape(text, quote=True)
+    escaped = escaped.replace("`", "&#96;").replace("$", "&#36;")
+    return escaped
+
+
 def _bearing_to_compass(bearing: float) -> str:
     """Convert bearing degrees (0-360) to 16-point compass heading."""
     points = [
@@ -202,16 +216,15 @@ def build_map(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 1. Base Map centered on Tennessee
+    # 1. Base Map centered on Tennessee (requires no API key)
     m = folium.Map(
         location=[35.86, -86.35],
         zoom_start=7,
-        tiles="CartoDB positron",
+        tiles="OpenStreetMap",
         prefer_canvas=True,
     )
 
     # Alternative Basemaps
-    folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
     folium.TileLayer(
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
         attr="Esri",
@@ -271,7 +284,7 @@ def build_map(
                 fill_color="#f5c518",
                 fill_opacity=0.9,
                 popup=popup,
-                tooltip=s.name,
+                tooltip=_safe_tooltip(s.name),
             ).add_to(fg_tn)
         else:
             total_border += 1
@@ -284,7 +297,7 @@ def build_map(
                 fill_color="#94a3b8",
                 fill_opacity=0.7,
                 popup=popup,
-                tooltip=f"{s.name} (Border)",
+                tooltip=_safe_tooltip(f"{s.name} (Border)"),
             ).add_to(fg_border)
 
     fg_tn.add_to(m)
@@ -336,7 +349,7 @@ def build_map(
                 ),
                 max_width=320,
             ),
-            tooltip=f"Constraining Store: {s.name} ({ns.distance_miles:.2f} mi)",
+            tooltip=_safe_tooltip(f"Constraining Store: {s.name} ({ns.distance_miles:.2f} mi)"),
         ).add_to(fg_furthest)
 
     # 4c. Prominent target marker at furthest point

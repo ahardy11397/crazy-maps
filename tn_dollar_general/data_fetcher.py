@@ -28,9 +28,10 @@ OVERPASS_ENDPOINTS = [
 ]
 
 TN_BOUNDARY_URLS = [
+    # Census 1:500k state polygons — high resolution (spec 3.1), tried first
+    "https://eric.clst.org/assets/wiki/uploads/Stuff/gz_2010_us_040_00_500k.json",
     "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json",
     "https://raw.githubusercontent.com/python-visualization/folium-example-data/main/us_states.json",
-    "https://eric.clst.org/assets/wiki/files/Tennessee/gz_2010_us_040_00_500k.json",
 ]
 
 
@@ -131,7 +132,7 @@ def parse_and_deduplicate_overpass(
 ) -> list[StoreRecord]:
     """Parse raw Overpass elements, filter out warehouses/distribution centers,
 
-    deduplicate co-located points within dedup_distance_m using EPSG:6576 and KDTree,
+    deduplicate co-located points within dedup_distance_m using EPSG:6575 and KDTree,
     and tag whether each store is inside TN.
     """
     candidates = []
@@ -181,7 +182,7 @@ def parse_and_deduplicate_overpass(
 
         score = _tag_richness_score(tags)
         candidates.append({
-            "id": str(el.get("id", "")),
+            "id": f"{el_type}/{el.get('id', '')}",
             "name": store_name,
             "lat": lat,
             "lon": lon,
@@ -211,7 +212,7 @@ def parse_and_deduplicate_overpass(
             )
         ]
 
-    transformer = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:6576", always_xy=True)
+    transformer = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:6575", always_xy=True)
     lons = [c["lon"] for c in candidates]
     lats = [c["lat"] for c in candidates]
     xs, ys = transformer.transform(lons, lats)
