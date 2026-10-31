@@ -57,7 +57,7 @@ def run_pipeline(
 
     # 3. Compute furthest point
     logger.info("Step 3/5: Computing exact furthest point via Voronoi and WGS84 geodesic optimization...")
-    result = find_furthest_point(tn_geom=tn_geom, stores=stores, grid_step_m=2000.0)
+    result = find_furthest_point(tn_geom=tn_geom, stores=stores)
 
     # 4. Generate interactive map
     map_output_path = output_dir / "tn_dollar_general_map.html"

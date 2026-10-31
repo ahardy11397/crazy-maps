@@ -2,6 +2,7 @@
 name = "crazy-maps"
 version = "0.1.0"
 description = "Tennessee Dollar General Map & Furthest Point Finder"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "shapely>=2.0",
