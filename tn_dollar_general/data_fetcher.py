@@ -5,6 +5,7 @@ from pathlib import Path
 import json
 import logging
 import re
+import time
 
 import numpy as np
 import pyproj
@@ -375,3 +376,129 @@ def fetch_dollar_generals(
             last_error = exc
 
     raise RuntimeError(f"All Overpass endpoints failed: {last_error}")
+
+
+class HTTPNominatimClient:
+    """Polite Nominatim reverse client: exactly one request message then time.sleep(delay_seconds)."""
+
+    def __init__(
+        self,
+        endpoint: str = "https://nominatim.openstreetmap.org/reverse",
+        delay_seconds: float = 1.05,
+    ) -> None:
+        self.endpoint = endpoint
+        self.delay_seconds = delay_seconds
+        self.user_agent = f"{DEFAULT_USER_AGENT} address-enrichment"
+
+    def reverse(self, lat: float, lon: float) -> dict | None:
+        """Reverse-geocode one point; return the Nominatim JSON dict or None on any failure."""
+        try:
+            resp = requests.get(
+                self.endpoint,
+                params={"lat": lat, "lon": lon, "format": "json", "zoom": 18, "addressdetails": 1},
+                headers={"User-Agent": self.user_agent},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data if isinstance(data, dict) else None
+        except Exception as exc:
+            logger.warning("Nominatim reverse geocode failed for (%s, %s): %s", lat, lon, exc)
+            return None
+        finally:
+            time.sleep(self.delay_seconds)
+
+
+def _load_address_cache(address_cache_path: Path) -> dict[str, str]:
+    """Load the id-keyed address cache; a missing/malformed/wrong-version file yields {}."""
+    if not address_cache_path.exists():
+        return {}
+    try:
+        data = json.loads(address_cache_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Address cache %s unreadable, starting fresh: %s", address_cache_path, exc)
+        return {}
+    if not isinstance(data, dict) or data.get("version") != 1:
+        logger.warning("Address cache %s has an unexpected format, starting fresh", address_cache_path)
+        return {}
+    addresses = data.get("addresses")
+    return dict(addresses) if isinstance(addresses, dict) else {}
+
+
+def _join_address_parts(first_part: str, city: str | None, state: str | None) -> str:
+    # Display order: house_number+road, city, state — ", "-joined, empties dropped.
+    parts = [part for part in (first_part, city, state) if part]
+    return ", ".join(parts)
+
+
+def enrich_store_addresses(
+    stores: list[StoreRecord],
+    address_cache_path: Path | str,
+    refresh: bool = False,
+    client: HTTPNominatimClient | None = None,
+) -> dict[str, str]:
+    """Return {store_id: display_address} for every store that has an address.
+
+    Stores carrying the complete own-data triple (housenumber+street+city --
+    state defaults to "TN" inside TN) are composed without any network call;
+    incomplete stores are reverse-geocoded via ``client.reverse(lat, lon)``.
+    Successful geocodes are cached id-keyed in ``address_cache_path``; a
+    per-store failure (None return or raised exception) is skipped -- never
+    raised and never cached. ``refresh=True`` ignores the existing cache and
+    re-geocodes every incomplete store (previous entries still survive on disk).
+    """
+    if client is None:
+        client = HTTPNominatimClient()
+    cache_path = Path(address_cache_path)
+    cached = {} if refresh else _load_address_cache(cache_path)
+
+    display: dict[str, str] = {}
+    new_entries: dict[str, str] = {}
+
+    for store in stores:
+        if store.id in cached:
+            display[store.id] = cached[store.id]
+            continue
+        if store.housenumber and store.street and store.city:
+            state = store.state or ("TN" if store.in_tn else None)
+            first_part = " ".join(part for part in (store.housenumber, store.street) if part)
+            display[store.id] = _join_address_parts(first_part, store.city, state)
+            continue
+        try:
+            data = client.reverse(store.lat, store.lon)
+        except Exception as exc:
+            logger.warning("Address enrichment failed for %s: %s", store.id, exc)
+            continue
+        if not data:
+            continue
+        address = data.get("address") or {}
+        first_part = " ".join(
+            part for part in (address.get("house_number"), address.get("road")) if part
+        )
+        city = (
+            address.get("city")
+            or address.get("town")
+            or address.get("village")
+            or address.get("hamlet")
+        )
+        state = address.get("state") or ("TN" if store.in_tn else None)
+        text = _join_address_parts(first_part, city, state)
+        if not text:
+            continue
+        display[store.id] = text
+        new_entries[store.id] = text
+
+    if new_entries:
+        # Verbatim brief semantics: a normal run writes only the newly
+        # geocoded entries. A refresh run ignores those entries for lookups
+        # but preserves previously geocoded addresses on disk (spec 5.4
+        # durability: store re-fetch must not discard them).
+        merged = dict(new_entries)
+        if refresh:
+            merged.update(_load_address_cache(cache_path))
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps({"version": 1, "addresses": merged}, indent=2), encoding="utf-8"
+        )
+
+    return display

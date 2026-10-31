@@ -3,10 +3,13 @@ from unittest.mock import patch, MagicMock
 import json
 from shapely.geometry import box, MultiPolygon, Polygon
 from tn_dollar_general.data_fetcher import (
+    DEFAULT_USER_AGENT,
     StoreRecord,
     TN_BOUNDARY_URLS,
+    HTTPNominatimClient,
     parse_boundary_geojson,
     parse_and_deduplicate_overpass,
+    enrich_store_addresses,
     fetch_dollar_generals,
     fetch_tn_boundary,
 )
@@ -246,3 +249,130 @@ def test_fetch_tn_boundary_caching_and_download(tmp_path: Path):
         cached_geom = fetch_tn_boundary(cache_file, refresh=False)
         assert cached_geom.is_valid
         assert mock_get2.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Address enrichment via Nominatim (id-keyed separate cache)
+# ---------------------------------------------------------------------------
+
+def _store(store_id, lat, lon, city=None, street=None, state=None,
+           housenumber=None, in_tn=True):
+    return StoreRecord(
+        id=store_id, name="Dollar General", lat=lat, lon=lon,
+        city=city, street=street, state=state, in_tn=in_tn,
+        housenumber=housenumber,
+    )
+
+
+class _FakeNominatimClient:
+    """Same button as HTTPNominatimClient: reverse(lat, lon) -> dict | None.
+
+    Records every (lat, lon) call; never touches the network.
+    """
+
+    def __init__(self, responses=None, raise_for=()):
+        self.calls = []
+        self.responses = responses or {}
+        self.raise_for = set(raise_for)
+
+    def reverse(self, lat, lon):
+        self.calls.append((lat, lon))
+        if (lat, lon) in self.raise_for:
+            raise RuntimeError("nominatim unreachable")
+        address = self.responses.get((lat, lon))
+        return {"address": address} if address is not None else None
+
+
+def test_enrich_geocodes_only_incomplete_and_uses_cache(tmp_path):
+    # 3 stores: A complete (housenumber+street+city), B complete but
+    # pre-seeded in the cache file, C incomplete. Only C may be geocoded
+    # live. The fake records (lat, lon) calls; C is the only store whose
+    # coords get looked up.
+    cache_file = tmp_path / "store_addresses.json"
+    cache_file.write_text(
+        json.dumps({"version": 1, "addresses": {"node/2": "3 Old Hwy, Pulaski, TN"}}),
+        encoding="utf-8",
+    )
+    store_a = _store("way/1", 35.5, -86.0, city="Cedar Grove",
+                     street="New Life Ln", state="TN", housenumber="707")
+    store_b = _store("node/2", 35.2, -86.2, city="Pulaski",
+                     street="Old Hwy", state="TN", housenumber="3")
+    store_c = _store("node/3", 35.1, -86.1)
+    fake = _FakeNominatimClient(
+        responses={(35.1, -86.1): {"road": "Mock Rd", "house_number": "12",
+                                   "city": "Mock City", "state": "TN"}},
+    )
+
+    result = enrich_store_addresses([store_a, store_b, store_c], cache_file, client=fake)
+
+    assert fake.calls == [(store_c.lat, store_c.lon)]      # only C geocoded live
+    assert result["way/1"] == "707 New Life Ln, Cedar Grove, TN"  # composed without any call
+    assert result["node/2"] == "3 Old Hwy, Pulaski, TN"    # cache honored
+    assert result["node/3"] == "12 Mock Rd, Mock City, TN"
+    cache = json.loads(cache_file.read_text())
+    assert cache["version"] == 1 and set(cache["addresses"]) == {"node/3"}
+
+
+def test_enrich_failure_is_graceful_and_not_cached(tmp_path):
+    # Store C raises inside the client, store D's reverse returns None:
+    # both absent from the result and the cache, no exception, the
+    # complete store still enriches.
+    cache_file = tmp_path / "store_addresses.json"
+    complete = _store("way/1", 35.5, -86.0, city="Cedar Grove",
+                      street="New Life Ln", state="TN", housenumber="707")
+    raising = _store("node/2", 35.1, -86.1)
+    empty = _store("node/3", 35.3, -86.3)
+    fake = _FakeNominatimClient(
+        responses={(35.3, -86.3): None},
+        raise_for={(35.1, -86.1)},
+    )
+
+    result = enrich_store_addresses([complete, raising, empty], cache_file, client=fake)
+
+    assert "node/2" not in result
+    assert "node/3" not in result
+    assert result["way/1"] == "707 New Life Ln, Cedar Grove, TN"
+    assert not cache_file.exists()  # nothing successful to write -> no cache
+
+
+def test_enrich_display_composition_order(tmp_path):
+    # Geocoded parts compose in order house_number+road, city, state,
+    # ", "-joined, dropping empties -> "707 New Life Ln, Cedar Grove, TN".
+    cache_file = tmp_path / "store_addresses.json"
+    incomplete = _store("node/9", 35.0, -86.0)
+    fake = _FakeNominatimClient(
+        responses={(35.0, -86.0): {"road": "New Life Ln", "house_number": "707",
+                                   "city": "Cedar Grove", "state": "TN"}},
+    )
+
+    result = enrich_store_addresses([incomplete], cache_file, client=fake)
+
+    assert result == {"node/9": "707 New Life Ln, Cedar Grove, TN"}
+
+
+def test_http_nominatim_client_sends_one_request_then_sleeps(monkeypatch):
+    # Polite client: exactly one GET per reverse() call with a
+    # DEFAULT_USER_AGENT-suffixed UA, then time.sleep(delay_seconds).
+    sleeps = []
+    monkeypatch.setattr("time.sleep", lambda seconds: sleeps.append(seconds))
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {"address": {"road": "X"}}
+    get_calls = []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        get_calls.append({"url": url, "params": params,
+                          "headers": headers, "timeout": timeout})
+        return resp
+
+    monkeypatch.setattr("tn_dollar_general.data_fetcher.requests.get", fake_get)
+
+    client = HTTPNominatimClient()
+    result = client.reverse(35.5, -86.0)
+    client.reverse(35.6, -86.1)
+
+    assert result == {"address": {"road": "X"}}
+    assert [c["url"] for c in get_calls] == [client.endpoint] * 2
+    assert get_calls[0]["params"]["lat"] == 35.5
+    assert get_calls[0]["params"]["lon"] == -86.0
+    assert get_calls[0]["headers"]["User-Agent"].startswith(DEFAULT_USER_AGENT)
+    assert sleeps == [client.delay_seconds] * 2
