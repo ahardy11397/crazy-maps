@@ -442,10 +442,13 @@ def enrich_store_addresses(
     Stores carrying the complete own-data triple (housenumber+street+city --
     state defaults to "TN" inside TN) are composed without any network call;
     incomplete stores are reverse-geocoded via ``client.reverse(lat, lon)``.
-    Successful geocodes are cached id-keyed in ``address_cache_path``; a
-    per-store failure (None return or raised exception) is skipped -- never
-    raised and never cached. ``refresh=True`` ignores the existing cache and
-    re-geocodes every incomplete store (previous entries still survive on disk).
+    Successful geocodes are cached id-keyed in ``address_cache_path``; on
+    every write prior on-disk entries are preserved and newly geocoded
+    values win on id collision (spec 5.4: addresses persist, never
+    discarded). A per-store failure (bad payload, None return or raised
+    exception) is skipped -- never raised and never cached.
+    ``refresh=True`` ignores the existing cache for lookups and re-geocodes
+    every incomplete store.
     """
     if client is None:
         client = HTTPNominatimClient()
@@ -466,39 +469,41 @@ def enrich_store_addresses(
             continue
         try:
             data = client.reverse(store.lat, store.lon)
+            if not data:
+                continue
+            address = data.get("address") or {}
+            first_part = " ".join(
+                part for part in (address.get("house_number"), address.get("road")) if part
+            )
+            city = (
+                address.get("city")
+                or address.get("town")
+                or address.get("village")
+                or address.get("hamlet")
+            )
+            state = address.get("state") or ("TN" if store.in_tn else None)
+            text = _join_address_parts(first_part, city, state)
+            if not text:
+                continue
+            display[store.id] = text
+            new_entries[store.id] = text
         except Exception as exc:
             logger.warning("Address enrichment failed for %s: %s", store.id, exc)
             continue
-        if not data:
-            continue
-        address = data.get("address") or {}
-        first_part = " ".join(
-            part for part in (address.get("house_number"), address.get("road")) if part
-        )
-        city = (
-            address.get("city")
-            or address.get("town")
-            or address.get("village")
-            or address.get("hamlet")
-        )
-        state = address.get("state") or ("TN" if store.in_tn else None)
-        text = _join_address_parts(first_part, city, state)
-        if not text:
-            continue
-        display[store.id] = text
-        new_entries[store.id] = text
 
     if new_entries:
-        # Verbatim brief semantics: a normal run writes only the newly
-        # geocoded entries. A refresh run ignores those entries for lookups
-        # but preserves previously geocoded addresses on disk (spec 5.4
-        # durability: store re-fetch must not discard them).
-        merged = dict(new_entries)
-        if refresh:
-            merged.update(_load_address_cache(cache_path))
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(
-            json.dumps({"version": 1, "addresses": merged}, indent=2), encoding="utf-8"
-        )
+        # Merge semantics on ALL write paths (spec 5.4: addresses persist,
+        # never discarded): prior on-disk entries are kept and newly
+        # geocoded values win on id collision (a refresh re-geocode must
+        # overwrite its stale cached value).
+        merged = _load_address_cache(cache_path)
+        merged.update(new_entries)
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(
+                json.dumps({"version": 1, "addresses": merged}, indent=2), encoding="utf-8"
+            )
+        except OSError as exc:
+            logger.warning("Could not persist address cache %s: %s", cache_path, exc)
 
     return display
