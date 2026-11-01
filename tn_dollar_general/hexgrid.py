@@ -17,10 +17,18 @@ upper neighbor because it is the most remote, and rank N has no lower one.
 All heavy work is vectorized: one projection pass for centers + stores, a single
 ``scipy.spatial.KDTree`` query for the planar pass, and one vectorized
 ``GEOD.inv`` pass for the WGS84 geodesic display distances.
+
+Click lookup / data block: ``build_click_table`` snaps a coarse (0.005 deg)
+bucket grid over the hex centers' clip extent to the geometrically nearest hex
+center (0xFFFFFFFF sentinel for cells beyond the clip bounds), and
+``encode_data_block`` packs the ranking, quantized centers, click table and
+store display strings into the little-endian base64 JSON block the JS decoder
+consumes.
 """
 
 from __future__ import annotations
 
+import base64
 import math
 from dataclasses import dataclass
 
@@ -180,3 +188,199 @@ def hex_vertices_m(centers: np.ndarray, hex_across_m: float) -> np.ndarray:
     angles = np.radians(angles_deg)
     offsets = R * np.column_stack([np.cos(angles), np.sin(angles)])  # (6, 2)
     return centers[:, None, :] + offsets[None, :, :]
+
+
+# ---------------------------------------------------------------------------
+# Click-lookup bucket grid + encoded data block
+# ---------------------------------------------------------------------------
+
+_CLICK_SENTINEL = 0xFFFFFFFF  # uint32 sentinel: no ranked hex resolves to this cell
+
+_CLIP_PROJ = "EPSG:6575"
+
+
+@dataclass(frozen=True)
+class ClickTable:
+    """Bucket grid over the hex centers' lat/lon (clip) extent for O(1) clicks.
+
+    ``idx`` is row-major over ``(lat_cells, lon_cells)``: cell ``(i, j)`` spans
+    ``[lat_min + i*cell_deg, lat_min + (i+1)*cell_deg)`` x
+    ``[lon_min + j*cell_deg, lon_min + (j+1)*cell_deg)`` and its value is
+    ``idx[i * lon_cells + j]`` — the hex index of the geometrically nearest hex
+    center, or :data:`_CLICK_SENTINEL` (0xFFFFFFFF) when the cell's own center
+    lies beyond the clip bounds. A click outside the grid resolves to the
+    sentinel too (checked by the JS decoder's cell math).
+    """
+
+    cell_deg: float                 # 0.005 (pinned default)
+    lat_min: float
+    lon_min: float
+    lat_cells: int
+    lon_cells: int
+    idx: np.ndarray                 # uint32 (lat_cells*lon_cells,)
+
+
+def build_click_table(hex_ranking: HexRanking, cell_deg: float = 0.005) -> ClickTable:
+    """Snap every bucket cell to the geometrically nearest hex center.
+
+    The grid covers the clip extent (the hex centers' min/max lat/lon) in
+    ``cell_deg`` steps; the ragged edge cells produced by the ceil are kept in
+    the array so any click inside the grid has a slot, but cells whose center
+    is beyond the clip bounds carry the sentinel instead of a hex index.
+    Distance is the WGS84 small-angle approximation: degrees with longitude
+    scaled by ``cos(mid-lat)``, accurate enough at ~0.5 km cells.
+    """
+    if cell_deg <= 0:
+        raise ValueError(f"cell_deg must be positive, got {cell_deg}")
+
+    centers = np.asarray(hex_ranking.centers_latlon, dtype=np.float64)
+    lats = centers[:, 0]
+    lons = centers[:, 1]
+    lat_min, lat_max = float(lats.min()), float(lats.max())
+    lon_min, lon_max = float(lons.min()), float(lons.max())
+
+    # Ceil with an epsilon guard so spans that are (numerically) a whole number
+    # of cells do not grow one spurious extra row/column.
+    lat_cells = max(1, int(math.ceil((lat_max - lat_min) / cell_deg - 1e-9)))
+    lon_cells = max(1, int(math.ceil((lon_max - lon_min) / cell_deg - 1e-9)))
+
+    # Cell centers, row-major: i (lat) outer, j (lon) inner.
+    cell_lats = lat_min + (np.arange(lat_cells) + 0.5) * cell_deg
+    cell_lons = lon_min + (np.arange(lon_cells) + 0.5) * cell_deg
+    q_lat = np.repeat(cell_lats, lon_cells)
+    q_lon = np.tile(cell_lons, lat_cells)
+
+    cos_mid = math.cos(math.radians(0.5 * (lat_min + lat_max)))
+    tree = scipy.spatial.KDTree(np.column_stack([lats, lons * cos_mid]))
+    _, nearest = tree.query(np.column_stack([q_lat, q_lon * cos_mid]), k=1)
+
+    idx = nearest.astype(np.uint32)
+    beyond = (
+        (q_lat > lat_max)
+        | (q_lat < lat_min)
+        | (q_lon > lon_max)
+        | (q_lon < lon_min)
+    )
+    idx[beyond] = _CLICK_SENTINEL
+
+    return ClickTable(
+        cell_deg=float(cell_deg),
+        lat_min=lat_min,
+        lon_min=lon_min,
+        lat_cells=lat_cells,
+        lon_cells=lon_cells,
+        idx=np.ascontiguousarray(idx, dtype=np.uint32),
+    )
+
+
+def _b64_le(array: np.ndarray) -> str:
+    """Little-endian base64 encoding of a numpy array's raw bytes."""
+    return base64.b64encode(np.ascontiguousarray(array).tobytes()).decode("ascii")
+
+
+def _quantize_u16(values: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Quantize ``values`` over ``[lo, hi]`` into uint16 in 0..65535."""
+    span = hi - lo
+    if span <= 0:
+        return np.zeros(len(values), dtype="<u2")
+    q = np.round((np.asarray(values, dtype=np.float64) - lo) / span * 65535.0)
+    return np.clip(q, 0.0, 65535.0).astype("<u2")
+
+
+def _store_address(store: StoreRecord, store_display: dict[str, str]) -> str:
+    """Display address for one store, mirroring the pinned composition order.
+
+    Task 2's enrichment value wins when present and non-empty; otherwise the
+    store's own housenumber+street, city, state triple is joined ("TN" for
+    in-TN stores without a state); otherwise the plain lat/lon coordinate
+    pair is the fallback for store-less/empty entries.
+    """
+    display = store_display.get(store.id, "") if store_display else ""
+    if not display:
+        first_part = " ".join(part for part in (store.housenumber, store.street) if part)
+        state = store.state or ("TN" if store.in_tn else None)
+        display = ", ".join(part for part in (first_part, store.city, state) if part)
+    if not display:
+        display = f"{store.lat:.5f}, {store.lon:.5f}"
+    return display
+
+
+def encode_data_block(
+    hex_ranking: HexRanking,
+    click_table: ClickTable,
+    store_display: dict[str, str],
+    stores: list[StoreRecord],
+) -> dict:
+    """Encode the pinned JSON data block consumed by the map's JS decoder.
+
+    All arrays are little-endian base64 over the raw bytes: ``dist_mi_q``
+    uint16 = ``round(geodesic_miles * 1000)``; ``rank_order`` uint32 = hex
+    index at rank 1..N; ``store_idx`` uint32; ``centers`` uint16 (lat, lon)
+    pairs quantized over the clip lat/lon ranges. ``top10`` is a plain list of
+    hex indices, most remote first; it always has length 10 and is padded with
+    the sentinel (0xFFFFFFFF) when the ranking holds fewer than 10 hexes.
+    ``click`` carries the bucket grid verbatim plus its base64 uint32 ``idx``.
+    Everything in the returned dict is JSON-serializable (no numpy types);
+    ``clip`` is derived here from the hex centers' min/max lat/lon and must
+    agree with the ``click_table`` built from the same ranking.
+    """
+    centers = np.asarray(hex_ranking.centers_latlon, dtype=np.float64)
+    lats = centers[:, 0]
+    lons = centers[:, 1]
+    lat_min, lat_max = float(lats.min()), float(lats.max())
+    lon_min, lon_max = float(lons.min()), float(lons.max())
+    n_hexes = int(hex_ranking.ranks)
+    n_stores = int(len(stores))
+
+    dist_mi_q = np.clip(
+        np.round(np.asarray(hex_ranking.geodesic_miles, dtype=np.float64) * 1000.0),
+        0.0,
+        65535.0,
+    ).astype("<u2")
+
+    # ``rank`` is a permutation of 1..N, so the stable argsort yields exactly
+    # the hex index at rank 1..N in slot order.
+    rank_order = np.argsort(np.asarray(hex_ranking.rank), kind="stable").astype("<u4")
+    store_idx = np.asarray(hex_ranking.store_idx, dtype=np.int64).astype("<u4")
+    centers_q = np.column_stack(
+        [
+            _quantize_u16(lats, lat_min, lat_max),
+            _quantize_u16(lons, lon_min, lon_max),
+        ]
+    ).astype("<u2")
+
+    top10 = list(hex_ranking.top_k(10))
+    top10 = top10 + [_CLICK_SENTINEL] * (10 - len(top10))
+
+    stores_out = [
+        {
+            "id": str(store.id),
+            "name": str(store.name),
+            "address": _store_address(store, store_display),
+        }
+        for store in stores
+    ]
+
+    return {
+        "format": 1,
+        "totals": {"hexes": n_hexes, "stores": n_stores},
+        "clip": {
+            "lat": [lat_min, lat_max],
+            "lon": [lon_min, lon_max],
+            "proj": _CLIP_PROJ,
+        },
+        "dist_mi_q": _b64_le(dist_mi_q),
+        "rank_order": _b64_le(rank_order),
+        "store_idx": _b64_le(store_idx),
+        "centers": _b64_le(centers_q),
+        "click": {
+            "cell_deg": float(click_table.cell_deg),
+            "lat_min": float(click_table.lat_min),
+            "lon_min": float(click_table.lon_min),
+            "lat_cells": int(click_table.lat_cells),
+            "lon_cells": int(click_table.lon_cells),
+            "idx": _b64_le(click_table.idx),
+        },
+        "top10": [int(i) for i in top10],
+        "stores": stores_out,
+    }

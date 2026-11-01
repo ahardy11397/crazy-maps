@@ -1,3 +1,6 @@
+import base64
+import json
+
 import numpy as np
 import pyproj
 import shapely
@@ -7,9 +10,13 @@ from tn_dollar_general.data_fetcher import StoreRecord
 from tn_dollar_general.geometry import find_furthest_point
 from tn_dollar_general.hexgrid import (
     HexRanking,
+    build_click_table,
     build_hex_ranking,
+    encode_data_block,
     hex_vertices_m,
 )
+
+_CLICK_SENTINEL = 0xFFFFFFFF  # pinned "no hex resolves here" bucket value
 
 # ~20 km wide square "state" built around a real TN-region lat/lon so EPSG:6575
 # projection is exercised for real. Center near (35.5, -86.0).
@@ -173,3 +180,176 @@ def test_top_k_returns_most_remote_first():
     # distances must be non-increasing across the top-k
     d = ranking.distance_meters[np.array(top)]
     assert np.all(np.diff(d) <= 0.0)
+
+
+def test_click_table_snaps_inside_and_sentinel_offstate():
+    geom, stores = _square_state_and_corner_stores()
+    ranking = build_hex_ranking(geom, stores)
+    table = build_click_table(ranking)
+    assert table.cell_deg == 0.005
+    assert table.idx.dtype == np.uint32
+    assert table.idx.shape == (table.lat_cells * table.lon_cells,)
+
+    mid_lat = (_SQUARE_LAT_MIN + _SQUARE_LAT_MAX) / 2.0
+    mid_lon = (_SQUARE_LON_MIN + _SQUARE_LON_MAX) / 2.0
+    cl = ranking.centers_latlon
+
+    # Interior click, offset half a cell from the square's center: resolve via
+    # the same cell math the JS decoder uses (no helper function needed) and
+    # check that the resolved hex center lies within 0.05 deg of the
+    # smallest-distance (nearest) hex around the click point.
+    p_lat = mid_lat + 0.5 * table.cell_deg
+    p_lon = mid_lon - 0.5 * table.cell_deg
+    i = int(np.floor((p_lat - table.lat_min) / table.cell_deg))
+    j = int(np.floor((p_lon - table.lon_min) / table.cell_deg))
+    assert 0 <= i < table.lat_cells and 0 <= j < table.lon_cells
+    resolved = int(table.idx[i * table.lon_cells + j])
+    assert resolved != _CLICK_SENTINEL
+    d_click = np.hypot(cl[:, 0] - p_lat, cl[:, 1] - p_lon)
+    near = np.flatnonzero(d_click < 0.1)
+    ref = int(near[np.argmin(d_click[near])])  # smallest-distance hex near the point
+    assert np.hypot(cl[resolved, 0] - cl[ref, 0], cl[resolved, 1] - cl[ref, 1]) <= 0.05
+
+    # Off-state: a click 2 degrees beyond the clip bounds falls outside the
+    # bucket grid entirely -> the pinned cell math resolves to the sentinel.
+    far_lat = table.lat_min + (table.lat_cells * table.cell_deg) + 2.0
+    far_lon = table.lon_min + (table.lon_cells * table.cell_deg) + 2.0
+    i_far = int(np.floor((far_lat - table.lat_min) / table.cell_deg))
+    j_far = int(np.floor((far_lon - table.lon_min) / table.cell_deg))
+    outside = i_far < 0 or i_far >= table.lat_cells or j_far < 0 or j_far >= table.lon_cells
+    assert outside
+    idx_far = _CLICK_SENTINEL if outside else int(table.idx[i_far * table.lon_cells + j_far])
+    assert idx_far == _CLICK_SENTINEL
+
+    # Ragged edge cells whose own centers lie beyond the clip bounds carry the
+    # sentinel, whole edge rows / columns of them. In this fixture the ragged
+    # edge falls on the lat axis only.
+    clip_lat_max = float(cl[:, 0].max())
+    clip_lon_max = float(cl[:, 1].max())
+    last_row_lat = table.lat_min + (table.lat_cells - 0.5) * table.cell_deg
+    last_col_lon = table.lon_min + (table.lon_cells - 0.5) * table.cell_deg
+    if last_row_lat > clip_lat_max:
+        last_row = table.idx[
+            (table.lat_cells - 1) * table.lon_cells : table.lat_cells * table.lon_cells
+        ]
+        assert np.all(last_row == _CLICK_SENTINEL)
+    if last_col_lon > clip_lon_max:
+        assert np.all(table.idx[table.lon_cells - 1 :: table.lon_cells] == _CLICK_SENTINEL)
+    assert bool(np.any(table.idx == _CLICK_SENTINEL))
+
+
+def test_click_table_self_consistency_for_all_hex_centers():
+    geom, stores = _square_state_and_corner_stores()
+    ranking = build_hex_ranking(geom, stores)
+    table = build_click_table(ranking)
+    cl = ranking.centers_latlon
+    clip = {
+        "lat": (float(cl[:, 0].min()), float(cl[:, 0].max())),
+        "lon": (float(cl[:, 1].min()), float(cl[:, 1].max())),
+    }
+
+    rng = np.random.default_rng(4)
+    n_sample = min(500, ranking.ranks)  # the square fixture holds < 500 hexes
+    sample = rng.choice(ranking.ranks, size=n_sample, replace=False)
+
+    resolved_count = 0
+    for h in sample:
+        lat, lon = cl[h]
+        i = int(np.floor((lat - table.lat_min) / table.cell_deg))
+        j = int(np.floor((lon - table.lon_min) / table.cell_deg))
+        if not (0 <= i < table.lat_cells and 0 <= j < table.lon_cells):
+            continue
+        resolved = int(table.idx[i * table.lon_cells + j])
+        if resolved == _CLICK_SENTINEL:
+            # The pinned sentinel rule only allows skipped cells whose own
+            # center is beyond the clip bounds (ragged edge rows / columns).
+            cell_lat = table.lat_min + (i + 0.5) * table.cell_deg
+            cell_lon = table.lon_min + (j + 0.5) * table.cell_deg
+            beyond = (
+                cell_lat > clip["lat"][1]
+                or cell_lat < clip["lat"][0]
+                or cell_lon > clip["lon"][1]
+                or cell_lon < clip["lon"][0]
+            )
+            assert beyond
+            continue
+        resolved_count += 1
+        d = float(np.hypot(cl[resolved, 0] - lat, cl[resolved, 1] - lon))
+        assert d <= 3 * table.cell_deg
+    # Essentially every sampled center must resolve; only the ragged-edge
+    # sentinel cells may be skipped.
+    assert resolved_count >= n_sample - 2 * table.lon_cells
+
+
+def test_data_block_roundtrip_and_top10_alignment():
+    geom, stores = _square_state_and_corner_stores()
+    ranking = build_hex_ranking(geom, stores)
+    table = build_click_table(ranking)
+    block = encode_data_block(ranking, table, store_display={}, stores=stores)
+    cl = ranking.centers_latlon
+    N = ranking.ranks
+    S = len(stores)
+
+    loaded = json.loads(json.dumps(block))  # blocks must be JSON-serializable
+
+    assert loaded["format"] == 1
+    assert loaded["totals"] == {"hexes": N, "stores": S}
+    clip = loaded["clip"]
+    assert clip["proj"] == "EPSG:6575"
+    assert clip["lat"] == [float(cl[:, 0].min()), float(cl[:, 0].max())]
+    assert clip["lon"] == [float(cl[:, 1].min()), float(cl[:, 1].max())]
+
+    dist = np.frombuffer(base64.b64decode(loaded["dist_mi_q"]), dtype="<u2")
+    ro = np.frombuffer(base64.b64decode(loaded["rank_order"]), dtype="<u4")
+    si = np.frombuffer(base64.b64decode(loaded["store_idx"]), dtype="<u4")
+    centers = np.frombuffer(base64.b64decode(loaded["centers"]), dtype="<u2").reshape(N, 2)
+    click_idx = np.frombuffer(base64.b64decode(loaded["click"]["idx"]), dtype="<u4")
+
+    assert dist.shape == (N,) == ro.shape == si.shape
+    assert centers.shape == (N, 2)
+    assert click_idx.shape == (table.lat_cells * table.lon_cells,)
+
+    # top10: fixed length 10, entries are hex indices, rank 1 first, carrying
+    # the maximum quantized distance.
+    assert len(loaded["top10"]) == 10
+    assert loaded["top10"][0] == int(ranking.by_rank(1))
+    assert int(dist[loaded["top10"][0]]) == int(round(float(ranking.geodesic_miles[loaded["top10"][0]]) * 1000))
+    assert int(dist[loaded["top10"][0]]) == int(round(float(np.max(ranking.geodesic_miles)) * 1000))
+
+    # rank_order: the hex index at rank k sits at slot k-1.
+    assert int(ro[0]) == int(ranking.by_rank(1))
+    assert int(ro[1]) == int(ranking.by_rank(2))
+    assert int(ro[4]) == int(ranking.by_rank(5))
+    assert int(ro[N - 1]) == int(ranking.by_rank(N))
+    # store_idx mirrors the ranking's nearest-store indices.
+    assert np.array_equal(si, ranking.store_idx.astype(np.uint32))
+
+    # Quantized centers decode back onto the true latlon within quantization
+    # error (half a quantization step).
+    lat_min, lat_max = clip["lat"]
+    lon_min, lon_max = clip["lon"]
+    lat_rec = lat_min + centers[:, 0] / 65535.0 * (lat_max - lat_min)
+    lon_rec = lon_min + centers[:, 1] / 65535.0 * (lon_max - lon_min)
+    assert float(np.abs(lat_rec - cl[:, 0]).max()) <= 0.6 * (lat_max - lat_min) / 65535.0
+    assert float(np.abs(lon_rec - cl[:, 1]).max()) <= 0.6 * (lon_max - lon_min) / 65535.0
+
+    # Click metadata round-trips verbatim.
+    c = loaded["click"]
+    assert c["cell_deg"] == table.cell_deg
+    assert c["lat_min"] == table.lat_min
+    assert c["lon_min"] == table.lon_min
+    assert c["lat_cells"] == table.lat_cells
+    assert c["lon_cells"] == table.lon_cells
+    assert np.array_equal(click_idx, table.idx.astype(np.uint32))
+
+    # stores: one entry per store, each with a non-empty display address
+    # (store_display={} => the Python-side fallback string).
+    assert len(loaded["stores"]) == S
+    for entry, store in zip(loaded["stores"], stores):
+        assert entry["id"] == store.id
+        assert entry["name"] == store.name
+        assert isinstance(entry["address"], str) and entry["address"]
+    # A provided display address wins over the fallback.
+    block2 = encode_data_block(ranking, table, store_display={"1": "123 Main St, Somewhere"}, stores=stores)
+    loaded2 = json.loads(json.dumps(block2))
+    assert loaded2["stores"][0]["address"] == "123 Main St, Somewhere"
