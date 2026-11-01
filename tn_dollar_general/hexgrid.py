@@ -31,6 +31,13 @@ from __future__ import annotations
 import base64
 import math
 from dataclasses import dataclass
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg", force=True)  # headless PNG rendering only, per spec
+import matplotlib.collections
+import matplotlib.pyplot
 
 import numpy as np
 import pyproj
@@ -384,3 +391,110 @@ def encode_data_block(
         "top10": [int(i) for i in top10],
         "stores": stores_out,
     }
+
+
+# ---------------------------------------------------------------------------
+# Remoteness raster overlay: one transparent-background PNG of the hex field
+# ---------------------------------------------------------------------------
+
+# Pinned blue ramp (spec): componentwise linear blend of the two endpoint RGB
+# triples only — no intermediate palette stops. ``distance_norm`` 0 (nearest a
+# store, lightest) → 1 (rank 1, deepest navy).
+_RAMP_LO_RGB = np.array([0xE8, 0xF4, 0xFF], dtype=np.float64) / 255.0
+_RAMP_HI_RGB = np.array([0x0F, 0x1F, 0x45], dtype=np.float64) / 255.0
+
+# Small-extent resolution floor (see render_remoteness_png): the pinned default
+# builder scale is px_per_hex px per hexagon-across (6 px per km at 1000 m
+# hexes), which yields inspectable images at state scale; on small-area builds
+# that scale would fall to a few dozen pixels wide, so the shorter image side is
+# floored at this tile-scale minimum instead.
+_MIN_RASTER_SIDE_PX = 512
+
+_SAVE_DPI = 100.0
+
+
+def _ramp_color(distance_norm: np.ndarray) -> np.ndarray:
+    """Pinned remoteness RGBA colors: componentwise blend of the two endpoints.
+
+    ``distance_norm`` is clamped to 0..1; the RGB triple lerps linearly and
+    componentwise from :data:`_RAMP_LO_RGB` (0.0, lightest, near a store) to
+    :data:`_RAMP_HI_RGB` (1.0, deepest navy, rank 1). Alpha is always 1.0 —
+    hexes are fully opaque and the transparent mask comes from the figure
+    background (``savefig(transparent=True)``), not from per-hex alpha.
+
+    Returns an ``(..., 4)`` float64 array shaped like the input plus a trailing
+    RGBA axis.
+    """
+    t = np.clip(np.asarray(distance_norm, dtype=np.float64), 0.0, 1.0)[..., None]
+    rgb = _RAMP_LO_RGB + t * (_RAMP_HI_RGB - _RAMP_LO_RGB)
+    alpha = np.ones_like(rgb[..., :1])
+    return np.concatenate([rgb, alpha], axis=-1)
+
+
+def render_remoteness_png(
+    hex_ranking: HexRanking,
+    output_path: Path | str,
+    px_per_hex: int = 6,
+) -> Path:
+    """Render the whole ranked hex field to ONE transparent-background PNG.
+
+    Anti-goal honored: the browser consumes a single image — never thousands of
+    vector hex shapes. Exactly one ``matplotlib`` ``PolyCollection`` carries
+    every hexagon from ``hex_vertices_m`` with facecolors from the pinned ramp
+    (:func:`_ramp_color`) over ``distance / max(distance)``.
+
+    Geometry: the image spans the bounds of the hex vertices themselves (a
+    superset of the projected EPSG:6575 bounds, so no hexagon is clipped at an
+    image edge) at the true projected-meters aspect; ``axes`` fill the figure
+    edge to edge with no ticks or frame. Edges are drawn un-antialiased in each
+    hexagon's own face color, so adjacent hexes share exact boundary pixels and
+    pixel alpha is exactly 1.0 inside the hex field and 0 outside it.
+
+    Pixel size: ``px_per_hex`` pixels per across-flats hexagon span
+    (``px_per_hex`` px per km at the pinned 1000 m default), brokered through a
+    fixed 100 dpi canvas. When that scale would floor the shorter image side
+    below :data:`_MIN_RASTER_SIDE_PX` (tiny build extents), the scale is raised
+    to the floor instead — never lowered at state scale.
+    """
+    if px_per_hex <= 0:
+        raise ValueError(f"px_per_hex must be positive, got {px_per_hex}")
+
+    verts = hex_vertices_m(hex_ranking.centers_m, hex_ranking.hex_across_m)
+    minx = float(verts[..., 0].min())
+    maxx = float(verts[..., 0].max())
+    miny = float(verts[..., 1].min())
+    maxy = float(verts[..., 1].max())
+
+    distance = np.asarray(hex_ranking.distance_meters, dtype=np.float64)
+    dmax = float(distance.max()) if distance.size else 0.0
+    distance_norm = distance / dmax if dmax > 0.0 else np.zeros_like(distance)
+
+    # Builder scale: px_per_hex px per hexagon-across, floored on the shorter
+    # side for very small extents (test fixtures); never lowered at state scale.
+    min_span = min(maxx - minx, maxy - miny)
+    scale = max(px_per_hex / hex_ranking.hex_across_m, _MIN_RASTER_SIDE_PX / min_span)
+    width_px = int(round((maxx - minx) * scale))
+    height_px = int(round((maxy - miny) * scale))
+
+    fig = matplotlib.pyplot.figure(
+        figsize=(width_px / _SAVE_DPI, height_px / _SAVE_DPI), dpi=_SAVE_DPI
+    )
+    try:
+        ax = fig.add_axes((0.0, 0.0, 1.0, 1.0))
+        ax.set_xlim(minx, maxx)
+        ax.set_ylim(miny, maxy)
+        ax.set_axis_off()
+        ax.add_collection(
+            matplotlib.collections.PolyCollection(
+                verts,
+                facecolors=_ramp_color(distance_norm),
+                edgecolors=_ramp_color(distance_norm),
+                antialiaseds=False,  # exact coverage: no seams, alpha strictly 0/1
+                linewidths=0.0,
+            )
+        )
+        output_path = Path(output_path)
+        fig.savefig(output_path, dpi=_SAVE_DPI, transparent=True)
+    finally:
+        matplotlib.pyplot.close(fig)
+    return output_path

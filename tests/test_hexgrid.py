@@ -1,5 +1,6 @@
 import base64
 import json
+import struct
 
 import numpy as np
 import pyproj
@@ -14,6 +15,8 @@ from tn_dollar_general.hexgrid import (
     build_hex_ranking,
     encode_data_block,
     hex_vertices_m,
+    render_remoteness_png,
+    _ramp_color,
 )
 
 _CLICK_SENTINEL = 0xFFFFFFFF  # pinned "no hex resolves here" bucket value
@@ -353,3 +356,16 @@ def test_data_block_roundtrip_and_top10_alignment():
     block2 = encode_data_block(ranking, table, store_display={"1": "123 Main St, Somewhere"}, stores=stores)
     loaded2 = json.loads(json.dumps(block2))
     assert loaded2["stores"][0]["address"] == "123 Main St, Somewhere"
+
+
+def test_ramp_is_monotone_darkening():
+    rgb = _ramp_color(np.array([0.0, 0.5, 1.0]))
+    assert rgb[0, :3].sum() > rgb[1, :3].sum() > rgb[2, :3].sum()
+
+
+def test_render_remoteness_png_bounds_and_size(tmp_path):
+    geom, stores = _square_state_and_corner_stores()
+    png = render_remoteness_png(build_hex_ranking(geom, stores), tmp_path / "r.png")
+    data = png.read_bytes()
+    w, h = struct.unpack(">II", data[16:24])      # PNG IHDR
+    assert w > 400 and len(data) < 6 * 1024 * 1024
