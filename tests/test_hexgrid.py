@@ -365,7 +365,34 @@ def test_ramp_is_monotone_darkening():
 
 def test_render_remoteness_png_bounds_and_size(tmp_path):
     geom, stores = _square_state_and_corner_stores()
-    png = render_remoteness_png(build_hex_ranking(geom, stores), tmp_path / "r.png")
-    data = png.read_bytes()
+    raster = render_remoteness_png(build_hex_ranking(geom, stores), tmp_path / "r.png")
+    data = raster.path.read_bytes()
     w, h = struct.unpack(">II", data[16:24])      # PNG IHDR
+    # Fixture bounds are ~19,978 m across (~20 pinned 1000 m hexes), so strict
+    # 6 px/hex could never satisfy the pinned width threshold; the renderer's
+    # approved _MIN_RASTER_SIDE_PX floor raises the state scale here only.
     assert w > 400 and len(data) < 6 * 1024 * 1024
+
+
+def test_raster_image_bounds_latlon_track_projected_vertices(tmp_path):
+    geom, stores = _square_state_and_corner_stores()
+    raster = render_remoteness_png(build_hex_ranking(geom, stores), tmp_path / "r.png")
+    ranking = build_hex_ranking(geom, stores)
+    verts = hex_vertices_m(ranking.centers_m, ranking.hex_across_m)
+    min_x, max_x = float(verts[..., 0].min()), float(verts[..., 0].max())
+    min_y, max_y = float(verts[..., 1].min()), float(verts[..., 1].max())
+    to_wgs84 = pyproj.Transformer.from_crs("EPSG:6575", "EPSG:4326", always_xy=True)
+    corner_lons, corner_lats = to_wgs84.transform(
+        [min_x, min_x, max_x, max_x], [min_y, max_y, max_y, min_y]
+    )
+    corner_lats = np.asarray(corner_lats, dtype=np.float64)
+    corner_lons = np.asarray(corner_lons, dtype=np.float64)
+    lat_min, lon_min, lat_max, lon_max = raster.image_bounds_latlon
+    # Within half a hexagon across (≤ ~1 km ≈ 0.01 deg at TN latitudes) so the
+    # folium ImageOverlay registers the PNG image itself, not the clip rect.
+    assert abs(lat_min - float(corner_lats.min())) <= 0.01
+    assert abs(lat_max - float(corner_lats.max())) <= 0.01
+    assert abs(lon_min - float(corner_lons.min())) <= 0.01
+    assert abs(lon_max - float(corner_lons.max())) <= 0.01
+    # Ordering: (lat_min, lon_min) before (lat_max, lon_max).
+    assert lat_min < lat_max and lon_min < lon_max

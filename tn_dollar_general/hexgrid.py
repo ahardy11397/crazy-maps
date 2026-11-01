@@ -407,10 +407,28 @@ _RAMP_HI_RGB = np.array([0x0F, 0x1F, 0x45], dtype=np.float64) / 255.0
 # builder scale is px_per_hex px per hexagon-across (6 px per km at 1000 m
 # hexes), which yields inspectable images at state scale; on small-area builds
 # that scale would fall to a few dozen pixels wide, so the shorter image side is
-# floored at this tile-scale minimum instead.
+# floored at this tile-scale minimum instead. Controller-approved resolution of
+# the pinned-pin conflict: the pinned fixture test asserts width > 400, which is
+# unreachable at strict 6 px/hex on the 19,978 m square fixture (~20 hexes
+# across), so the floor only ever engages on small fixture extents and never
+# shrinks state-scale renders.
 _MIN_RASTER_SIDE_PX = 512
 
 _SAVE_DPI = 100.0
+
+
+@dataclass(frozen=True)
+class RemotenessRaster:
+    """Result of :func:`render_remoteness_png`.
+
+    ``image_bounds_latlon`` is ``(lat_min, lon_min, lat_max, lon_max)`` of the
+    rendered pixel extent (back-projected from the hex-vertex bounds in
+    projected EPSG:6575 metres), so Task 6 can pin ``folium``'s
+    ``ImageOverlay`` to the image itself rather than the clip rect.
+    """
+
+    path: Path
+    image_bounds_latlon: tuple[float, float, float, float]
 
 
 def _ramp_color(distance_norm: np.ndarray) -> np.ndarray:
@@ -435,7 +453,7 @@ def render_remoteness_png(
     hex_ranking: HexRanking,
     output_path: Path | str,
     px_per_hex: int = 6,
-) -> Path:
+) -> RemotenessRaster:
     """Render the whole ranked hex field to ONE transparent-background PNG.
 
     Anti-goal honored: the browser consumes a single image — never thousands of
@@ -455,6 +473,11 @@ def render_remoteness_png(
     fixed 100 dpi canvas. When that scale would floor the shorter image side
     below :data:`_MIN_RASTER_SIDE_PX` (tiny build extents), the scale is raised
     to the floor instead — never lowered at state scale.
+
+    Returns a :class:`RemotenessRaster` whose ``image_bounds_latlon`` are the
+    lat/lon bounds of the rendered pixel extent itself (the back-projection of
+    the hex-vertex spans the image covers, not the data block's clip rect), so
+    the ``folium`` ``ImageOverlay`` can register the PNG on the map exactly.
     """
     if px_per_hex <= 0:
         raise ValueError(f"px_per_hex must be positive, got {px_per_hex}")
@@ -497,4 +520,21 @@ def render_remoteness_png(
         fig.savefig(output_path, dpi=_SAVE_DPI, transparent=True)
     finally:
         matplotlib.pyplot.close(fig)
-    return output_path
+
+    # Back-project the four corners of the projected (EPSG:6575) pixel extent
+    # to WGS84 lat/lon — exactly what the image covers as drawn.
+    to_wgs84 = pyproj.Transformer.from_crs("EPSG:6575", "EPSG:4326", always_xy=True)
+    corner_lons, corner_lats = to_wgs84.transform(
+        [minx, minx, maxx, maxx], [miny, maxy, maxy, miny]
+    )
+    corner_lons = np.asarray(corner_lons, dtype=np.float64)
+    corner_lats = np.asarray(corner_lats, dtype=np.float64)
+    return RemotenessRaster(
+        path=output_path,
+        image_bounds_latlon=(
+            float(corner_lats.min()),
+            float(corner_lons.min()),
+            float(corner_lats.max()),
+            float(corner_lons.max()),
+        ),
+    )
