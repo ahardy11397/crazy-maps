@@ -1,16 +1,47 @@
 from __future__ import annotations
 
+import base64
 import html
+import json
 import logging
 from pathlib import Path
+
 import branca.element
 import folium
+import numpy as np
+import pyproj
 import shapely
+from folium import raster_layers
 
 from tn_dollar_general.data_fetcher import StoreRecord
 from tn_dollar_general.geometry import FurthestPointResult, geodesic_circle_coords
+from tn_dollar_general.hexgrid import (
+    HexRanking,
+    build_click_table,
+    encode_data_block,
+    hex_vertices_m,
+)
 
 logger = logging.getLogger(__name__)
+
+# Rail reserves its own column: map encoded at 100% - 350px, rail fixed at
+# 340px on the right + 10px gap, so no part of the map hides under the rail.
+_RAIL_WIDTH_PX = 340
+_RAIL_RESERVED_PX = 350
+
+
+def _rail_escape(text: str) -> str:
+    """Sanitize text for the rail's JSON payload / innerHTML rendering.
+
+    Mirrors :func:`_safe_tooltip`: html.escape on plain strings, plus
+    neutralized backticks and ``$`` so HTML payloads and ``${...}``-style
+    interpolation cannot survive into the baked HTML. The escaped form is
+    decoded back to visible text when the JS injects it via innerHTML, so
+    the display is unaffected.
+    """
+    escaped = html.escape(text, quote=True)
+    escaped = escaped.replace("`", "&#96;").replace("$", "&#36;")
+    return escaped
 
 
 def _safe_tooltip(text: str) -> str:
@@ -206,14 +237,404 @@ def _build_summary_card_html(total_tn: int, total_border: int, result: FurthestP
     """
 
 
+def _store_display_string(store: StoreRecord, address: str | None) -> str:
+    """Rail display string for one store, in the pinned composition order.
+
+    ``address`` (the Task 2 enrichment value) wins when not None/empty; else
+    the store's own ``housenumber+street, city, state`` triple ("TN" for
+    in-TN stores without a state); else the plain lat/lon coordinate pair.
+    The returned string is NOT escaped yet — callers route it through
+    :func:`_rail_escape` before it reaches the payload.
+    """
+    if address:
+        return address
+    first_part = " ".join(part for part in (store.housenumber, store.street) if part)
+    state = store.state or ("TN" if store.in_tn else None)
+    display = ", ".join(part for part in (first_part, store.city, state) if part)
+    if not display:
+        display = f"{store.lat:.5f}, {store.lon:.5f}"
+    return display
+
+
+def _raster_image_bounds(hex_ranking: HexRanking) -> tuple[float, float, float, float]:
+    """``(lat_min, lon_min, lat_max, lon_max)`` of the raster's pixel extent.
+
+    Replicates ``render_remoteness_png``'s own registration math (EPSG:6575
+    bounds of the hex vertices, back-projected at the four corners) so the
+    overlay is pinned to the PNG image itself rather than the clip rect.
+    Keep in sync with that function.
+    """
+    verts = hex_vertices_m(hex_ranking.centers_m, hex_ranking.hex_across_m)
+    minx = float(verts[..., 0].min())
+    maxx = float(verts[..., 0].max())
+    miny = float(verts[..., 1].min())
+    maxy = float(verts[..., 1].max())
+    to_wgs84 = pyproj.Transformer.from_crs("EPSG:6575", "EPSG:4326", always_xy=True)
+    corner_lons, corner_lats = to_wgs84.transform(
+        [minx, minx, maxx, maxx], [miny, maxy, maxy, miny]
+    )
+    corner_lats = np.asarray(corner_lats, dtype=np.float64)
+    corner_lons = np.asarray(corner_lons, dtype=np.float64)
+    return (
+        float(corner_lats.min()),
+        float(corner_lons.min()),
+        float(corner_lats.max()),
+        float(corner_lons.max()),
+    )
+
+
+def _add_raster_layer(m: folium.Map, hex_ranking: HexRanking, raster_png: Path | str) -> None:
+    """Bake exactly ONE raster: the remoteness PNG as a data: URI overlay.
+
+    Added first, before every other layer, so all later layers render above
+    it. Bounds come from the raster's own image extent in Leaflet order
+    ``[[lat_min, lon_min], [lat_max, lon_max]]``.
+    """
+    png_bytes = Path(raster_png).read_bytes()
+    data_uri = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+    lat_min, lon_min, lat_max, lon_max = _raster_image_bounds(hex_ranking)
+    marker = (
+        "<!-- Remoteness hex field baked as exactly one folium.raster_layers."
+        "ImageOverlay (the pinned anti-goal: never per-hex vector layers) -->\n"
+    )
+    m.get_root().html.add_child(branca.element.Element(marker))
+    raster_layers.ImageOverlay(
+        image=data_uri,
+        bounds=[[lat_min, lon_min], [lat_max, lon_max]],
+        name="Remoteness Raster",
+        interactive=False,
+    ).add_to(m)
+
+
+_RAIL_CSS_TEMPLATE = """
+<style>
+/* Side rail reserves its own column beside the map: the map container is
+   narrowed so the fixed RAIL (%(rail_px)s px) sits in reserved space and no
+   map area is hidden under it. The floating summary card (bottom-left) is
+   untouched and stays visible. */
+#%(map_id)s {
+    width: calc(100%% - %(reserved_px)spx) !important;
+    margin-right: %(reserved_px)spx;
+}
+#dg-rail {
+    position: fixed;
+    top: 0;
+    right: 0;
+    width: %(rail_px)spx;
+    height: 100%%;
+    z-index: 9000;
+    background: #f8fafc;
+    border-left: 1px solid rgba(0, 0, 0, 0.1);
+    box-shadow: -4px 0 12px -6px rgba(0, 0, 0, 0.25);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    color: #1e293b;
+    overflow-y: auto;
+}
+#dg-rail-header {
+    padding: 14px 16px 10px 16px;
+    border-bottom: 1px solid #e2e8f0;
+}
+#dg-rail-header h2 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 800;
+    color: #0f172a;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+#dg-rail-header p {
+    margin: 2px 0 0 0;
+    font-size: 11px;
+    color: #64748b;
+}
+#dg-rail-tabs {
+    display: flex;
+    border-bottom: 1px solid #e2e8f0;
+    background: #fff;
+}
+.dg-tab-btn {
+    flex: 1;
+    border: none;
+    background: transparent;
+    padding: 9px 6px;
+    font-size: 11.5px;
+    font-weight: 700;
+    color: #64748b;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+}
+.dg-tab-btn-active {
+    color: #b91c1c;
+    border-bottom-color: #dc2626;
+    background: #fef2f2;
+}
+#dg-tab-podium, #dg-tab-top10 {
+    padding: 12px 16px;
+    font-size: 12px;
+}
+.dg-card-hint { color: #64748b; font-size: 11.5px; line-height: 1.4; }
+.dg-rail-card {
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-left: 4px solid #dc2626;
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+}
+.dg-card-rank { font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; }
+.dg-card-miles { font-size: 22px; font-weight: 800; color: #b91c1c; line-height: 1.2; }
+.dg-card-miles .dg-miles-unit { font-size: 13px; font-weight: 600; color: #64748b; }
+.dg-card-store { font-size: 12.5px; font-weight: 600; color: #0f172a; margin-top: 4px; }
+.dg-card-addr { font-size: 11px; color: #475569; margin-top: 2px; line-height: 1.35; }
+.dg-top10-list { list-style: none; margin: 0; padding: 0; }
+.dg-top10-item {
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-bottom: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    color: #1e293b;
+}
+.dg-top10-item:hover { border-color: #dc2626; background: #fef2f2; }
+.dg-top10-item b { color: #b91c1c; }
+</style>
+"""
+
+_RAIL_HTML_TEMPLATE = """
+<div id="dg-rail">
+    <div id="dg-rail-header">
+        <h2>Tennessee Hex Remoteness</h2>
+        <p>Distance from every TN hexagon center to the nearest Dollar General.</p>
+    </div>
+    <div id="dg-rail-tabs">
+        <button id="dg-tab-btn-podium" class="dg-tab-btn dg-tab-btn-active" type="button">Remoteness Podium</button>
+        <button id="dg-tab-btn-top10" class="dg-tab-btn" type="button">Top 10 Most Remote</button>
+    </div>
+    <div id="dg-tab-podium">
+        <div class="dg-card-hint">Click any hexagon on the map to inspect its remoteness rank and nearest store.</div>
+    </div>
+    <div id="dg-tab-top10" style="display:none;"></div>
+</div>
+"""
+
+_RAIL_JS_TEMPLATE = """
+<script>
+(function () {
+    'use strict';
+    window.addEventListener('load', function () {
+        var blockEl = document.getElementById('dg-hex-data');
+        if (!blockEl) { return; }
+        var data;
+        try { data = JSON.parse(blockEl.textContent); }
+        catch (err) { return; }
+        var map = window['__MAP_ID__'];
+        if (!map || typeof L === 'undefined') { return; }
+
+        var NHexes = data.totals.hexes;
+        var SENTINEL = 4294967295;
+
+        function b64ToU8(b64) {
+            var bin = atob(b64);
+            var out = new Uint8Array(bin.length);
+            for (var p = 0; p < bin.length; p++) { out[p] = bin.charCodeAt(p); }
+            return out;
+        }
+        function u32List(b64) {
+            var dv = new DataView(b64ToU8(b64).buffer);
+            var arr = new Array(dv.byteLength / 4);
+            for (var p = 0; p < arr.length; p++) { arr[p] = dv.getUint32(p * 4, true); }
+            return arr;
+        }
+        function u16List(b64) {
+            var dv = new DataView(b64ToU8(b64).buffer);
+            var arr = new Array(dv.byteLength / 2);
+            for (var p = 0; p < arr.length; p++) { arr[p] = dv.getUint16(p * 2, true); }
+            return arr;
+        }
+
+        var rankOrder = u32List(data.rank_order);
+        var rankOf = new Array(NHexes);
+        for (var r = 0; r < NHexes; r++) { rankOf[rankOrder[r]] = r + 1; }
+        var storeIdx = u32List(data.store_idx);
+        var distMiQ = u16List(data.dist_mi_q);
+        var centersQ = u16List(data.centers);
+        var click = data.click;
+        var clip = data.clip;
+
+        function centerLatLon(h) {
+            return [
+                clip.lat[0] + centersQ[h * 2] / 65535.0 * (clip.lat[1] - clip.lat[0]),
+                clip.lon[0] + centersQ[h * 2 + 1] / 65535.0 * (clip.lon[1] - clip.lon[0]),
+            ];
+        }
+
+        var elPodium = document.getElementById('dg-tab-podium');
+        var elTop10 = document.getElementById('dg-tab-top10');
+        var btnPodium = document.getElementById('dg-tab-btn-podium');
+        var btnTop10 = document.getElementById('dg-tab-btn-top10');
+        if (!elPodium || !elTop10 || !btnPodium || !btnTop10) { return; }
+
+        function switchTab(which) {
+            var isPodium = which === 'podium';
+            elPodium.style.display = isPodium ? '' : 'none';
+            elTop10.style.display = isPodium ? 'none' : '';
+            btnPodium.className = isPodium ? 'dg-tab-btn dg-tab-btn-active' : 'dg-tab-btn';
+            btnTop10.className = isPodium ? 'dg-tab-btn' : 'dg-tab-btn dg-tab-btn-active';
+        }
+        btnPodium.addEventListener('click', function () { switchTab('podium'); });
+        btnTop10.addEventListener('click', function () { switchTab('top10'); });
+
+        // One ephemeral click highlight: a single dashed circle at the hex
+        // center, replaced on every click (never accumulated).
+        var highlight = null;
+        function pulse(latlon, doFly) {
+            var radius = (data.hex_across_m || 1000) / 2 + 100;
+            if (highlight) { map.removeLayer(highlight); }
+            highlight = L.circle(latlon, {
+                radius: radius,
+                color: '#ef4444',
+                weight: 2.5,
+                dashArray: '6, 6',
+                fill: false,
+                interactive: false,
+            });
+            highlight.addTo(map);
+            if (doFly) { map.flyTo(latlon); }
+        }
+
+        // Store text arrives in the data block already escaped by the builder;
+        // it is concatenated (never through a template literal) and inserted
+        // via innerHTML so the browser decodes entities to visible text.
+        function cardHtml(h) {
+            var s = data.stores[storeIdx[h]];
+            var nm = s && s.name ? s.name : 'Dollar General';
+            var addr = s && s.address ? s.address : '';
+            var addrLine = addr ? addr : 'no address on record';
+            return '<div class="dg-rail-card">'
+                + '<div class="dg-card-rank">#' + rankOf[h] + ' of ' + NHexes + ' hexes</div>'
+                + '<div class="dg-card-miles">' + (distMiQ[h] / 1000).toFixed(2)
+                + ' <span class="dg-miles-unit">mi</span></div>'
+                + '<div class="dg-card-store">DG — ' + nm + '</div>'
+                + '<div class="dg-card-addr">' + addrLine + '</div>'
+                + '</div>';
+        }
+
+        function showHexCard(h, doFly) {
+            switchTab('podium');
+            elPodium.innerHTML = cardHtml(h);
+            pulse(centerLatLon(h), doFly);
+        }
+
+        map.on('click', function (e) {
+            var i = Math.floor((e.latlng.lat - click.lat_min) / click.cell_deg);
+            var j = Math.floor((e.latlng.lng - click.lon_min) / click.cell_deg);
+            if (i < 0 || i >= click.lat_cells || j < 0 || j >= click.lon_cells) { return; }
+            var dv = new DataView(b64ToU8(click.idx).buffer);
+            var h = dv.getUint32((i * click.lon_cells + j) * 4, true);
+            if (h === SENTINEL) { return; }  // off-state: leave the rail untouched
+            showHexCard(h, false);
+        });
+
+        var listHtml = '';
+        for (var t = 0; t < data.top10.length; t++) {
+            var hex = data.top10[t];
+            if (hex === SENTINEL) { continue; }
+            var s = data.stores[storeIdx[hex]];
+            var nm = s && s.name ? s.name : 'Dollar General';
+            listHtml += '<li class="dg-top10-item" data-hex="' + hex + '"><b>#' + (t + 1)
+                + '</b> ' + (distMiQ[hex] / 1000).toFixed(2) + ' mi — DG — ' + nm + '</li>';
+        }
+        elTop10.innerHTML = '<ul class="dg-top10-list">' + listHtml + '</ul>';
+
+        var items = elTop10.querySelectorAll('.dg-top10-item');
+        for (var a = 0; a < items.length; a++) {
+            (function (li) {
+                li.addEventListener('click', function () {
+                    var hex = parseInt(li.getAttribute('data-hex'), 10);
+                    showHexCard(hex, true);  // fly to the quantized center, then pulse
+                });
+            })(items[a]);
+        }
+    });
+})();
+"""
+
+
+def _add_rail_and_data_block(
+    m: folium.Map,
+    hex_ranking: HexRanking,
+    stores: list[StoreRecord],
+    store_display: dict[str, str] | None,
+) -> None:
+    """Bake the pinned JSON data block + side rail UI/click JS onto the map.
+
+    All store text (name, id, display address) passes through
+    :func:`_rail_escape` before serialization: the payload is the only source,
+    and the JS re-renders it via innerHTML, so escaping here is the XSS gate.
+    """
+    map_id = m.get_name()
+    stores = list(stores)
+
+    click_table = build_click_table(hex_ranking)
+    display_map = {
+        s.id: _rail_escape(_store_display_string(s, (store_display or {}).get(s.id)))
+        for s in stores
+    }
+    block = encode_data_block(hex_ranking, click_table, display_map, stores)
+    for s, entry in zip(stores, block["stores"]):
+        entry["id"] = _rail_escape(str(s.id))
+        entry["name"] = _rail_escape(s.name or "Dollar General")
+        entry["address"] = display_map[s.id]
+    # Meta extension consumed by the JS highlight radius; adding keys is
+    # within the pinned schema (the Task 4 base64 layout is untouched).
+    block["hex_across_m"] = float(hex_ranking.hex_across_m)
+    payload = json.dumps(block, separators=(",", ":"), sort_keys=True)
+
+    data_script = (
+        '<script type="application/json" id="dg-hex-data">' + payload + "</script>"
+    )
+
+    # Format ONLY the templates. The JSON payload is data, not a format
+    # string: building it into the "%"-formatted chunk would crash (or corrupt)
+    # on any store name/address containing a percent sign.
+    rail_html = (
+        (_RAIL_CSS_TEMPLATE + _RAIL_HTML_TEMPLATE)
+        % {
+            "map_id": map_id,
+            "rail_px": _RAIL_WIDTH_PX,
+            "reserved_px": _RAIL_RESERVED_PX,
+        }
+        + data_script
+    )
+
+    rail_js = _RAIL_JS_TEMPLATE.replace("__MAP_ID__", map_id)
+
+    m.get_root().html.add_child(branca.element.Element(rail_html))
+    m.get_root().html.add_child(branca.element.Element(rail_js))
+
+
 def build_map(
     tn_geom: shapely.Geometry,
     stores: list[StoreRecord],
     result: FurthestPointResult,
     output_path: Path | str,
+    hex_ranking: HexRanking | None = None,
+    raster_png: Path | str | None = None,
+    store_display: dict[str, str] | None = None,
 ) -> Path:
-    """Build a self-contained interactive Folium map visualizing Dollar Generals and the furthest point."""
+    """Build a self-contained interactive Folium map visualizing Dollar Generals and the furthest point.
+
+    When ``hex_ranking`` is given (with the corresponding ``raster_png`` from
+    :func:`tn_dollar_general.hexgrid.render_remoteness_png`), the map also
+    carries: one baked remoteness raster overlay, the pinned side-rail UI
+    (podium/tab cards + top-10 jump list), and the click-handling data block.
+    When ``hex_ranking`` is None the output is exactly the pre-ranking map:
+    no raster, no rail, no data block.
+    """
     output_path = Path(output_path)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # 1. Base Map centered on Tennessee (requires no API key)
@@ -223,6 +644,13 @@ def build_map(
         tiles="OpenStreetMap",
         prefer_canvas=True,
     )
+
+    # 0. Single baked raster overlay, added FIRST so every later layer stays
+    # above it in the same Leaflet pane.
+    if hex_ranking is not None:
+        if raster_png is None:
+            raise ValueError("raster_png is required when hex_ranking is provided")
+        _add_raster_layer(m, hex_ranking, raster_png)
 
     # Alternative Basemaps
     folium.TileLayer(
@@ -370,7 +798,11 @@ def build_map(
     card_html = _build_summary_card_html(total_tn, total_border, result)
     m.get_root().html.add_child(branca.element.Element(card_html))
 
-    # 7. Save to HTML
+    # 7. Remoteness side rail + baked data block + click JS (ranked builds only)
+    if hex_ranking is not None:
+        _add_rail_and_data_block(m, hex_ranking, stores, store_display)
+
+    # 8. Save to HTML
     m.save(str(output_path))
     logger.info("Saved interactive map to %s", output_path)
 
