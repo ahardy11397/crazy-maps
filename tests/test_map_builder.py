@@ -3,6 +3,10 @@ from unittest.mock import patch
 import base64
 import dataclasses
 import json
+import math
+import re
+import shutil
+import subprocess
 import numpy as np
 import pytest
 from shapely.geometry import box
@@ -304,7 +308,10 @@ def test_build_map_embeds_data_block_and_rail(tmp_path, geom, stores, result, ti
     assert html_out.count('id="dg-hex-data"') == 1
     assert "Remoteness Podium" in html_out and "Top 10 Most Remote" in html_out
     assert html_out.count("ImageOverlay") == 1      # exactly one raster layer
-    assert html_out.count("L.imageOverlay(") == 1   # ...and it is really emitted
+    # The capital-I count above is matched by the marker comment (folium emits
+    # the layer as `L.imageOverlay`); the lowercase checks prove the real one.
+    assert html_out.count("L.imageOverlay(") == 1
+    assert html_out.count("data:image/png;base64,") == 1
     # The map container reserves the rail's column (nothing hidden under it)
     assert "width: calc(100% - 350px) !important" in html_out
 
@@ -322,7 +329,11 @@ def test_no_large_hex_vector_layers_in_output(tmp_path, geom, stores, result, ti
 
 
 def test_card_display_without_any_address_fields(tmp_path, geom, stores, result, tiny_hex_ranking):
-    addressless = dataclasses.replace(stores[0], housenumber=None, street=None, city=None)
+    # No address parts AND no state/TN fallback, so the composition order must
+    # land on the plain coordinate pair.
+    addressless = dataclasses.replace(
+        stores[0], housenumber=None, street=None, city=None, state=None, in_tn=False
+    )
     html_out = build_map(
         geom, [addressless, *stores[1:]], result, tmp_path / "addrless.html",
         hex_ranking=tiny_hex_ranking, raster_png=tmp_path / "r.png",
@@ -330,7 +341,8 @@ def test_card_display_without_any_address_fields(tmp_path, geom, stores, result,
     ).read_text()
     # Python bakes no cards; the JSON payload must carry the coordinate fallback,
     # and the JS template carries the pinned copy verbatim:
-    assert f"{addressless.lat:.4f}" in html_out
+    block = _extract_block(html_out)
+    assert block["stores"][0]["address"] == f"{addressless.lat:.5f}, {addressless.lon:.5f}"
     assert "no address on record" in html_out
 
 
@@ -423,7 +435,8 @@ def test_click_decode_end_to_end_top_rank_carries_max_distance(tmp_path, geom, s
 
     # Resolved card fields: rank line, 2-decimal miles, DG display prefix.
     miles = int(dec["dist_mi_q"][hex_at_click]) / 1000.0
-    assert f"{miles:.2f}" == f"{miles:.2f}"  # 2-decimal formatting exercised above
+    expected_miles = f"{float(np.max(ranking.geodesic_miles)):.2f}"
+    assert f"{miles:.2f}" == expected_miles
     card_store = block["stores"][int(dec["store_idx"][hex_at_click])]
     assert card_store["name"] == stores[int(ranking.store_idx[top1])].name
     assert card_store["address"] == _store_display_string(
@@ -437,5 +450,237 @@ def test_click_decode_end_to_end_top_rank_carries_max_distance(tmp_path, geom, s
     j_far = int(np.floor((far_lon - c["lon_min"]) / c["cell_deg"]))
     outside = i_far < 0 or i_far >= c["lat_cells"] or j_far < 0 or j_far >= c["lon_cells"]
     assert outside  # JS decoder bails out before touching the rail
-    # Sentinel slots never appear as a resolved hex index.
-    assert int(np.max(dec["click_idx"])) < ranking.ranks or np.any(dec["click_idx"] == _CLICK_SENTINEL)
+    # Sentinel slots never appear as a resolved hex index: every bucket is
+    # either a valid hex index or the sentinel.
+    non_sentinel = dec["click_idx"][dec["click_idx"] != _CLICK_SENTINEL]
+    assert np.all(non_sentinel < ranking.ranks)
+    # The fixture's own extent is an exact multiple of the pinned 0.005 deg
+    # cell, so its bucket grid has no ragged cells. A grid whose span is not
+    # an exact multiple proves the sentinel path is representable at all.
+    ragged = build_click_table(ranking, cell_deg=0.0037).idx
+    assert np.any(ragged == _CLICK_SENTINEL)
+    assert np.all(ragged[ragged != _CLICK_SENTINEL] < ranking.ranks)
+
+
+# --- Task 6 review: committed end-to-end run of the baked rail JS ---------
+
+
+def _extract_rail_script(html_text: str) -> str:
+    """Pull the rail's own ``<script>`` body out of the baked map HTML."""
+    for match in re.finditer(r"<script>(.*?)</script>", html_text, re.DOTALL):
+        body = match.group(1)
+        if "getElementById('dg-hex-data')" in body and "addEventListener('load'" in body:
+            return body.strip()
+    raise AssertionError("rail <script> not found in baked map")
+
+
+_RAIL_HARNESS = r"""
+'use strict';
+const BLOCK = __BLOCK__;
+const CLICKS = __CLICKS__;
+function El(id) {
+  return {
+    id: id, style: {}, className: '', innerHTML: '', _h: {},
+    addEventListener(ev, fn) { (this._h[ev] = this._h[ev] || []).push(fn); },
+    fire(ev) { (this._h[ev] || []).forEach(fn => fn()); },
+    querySelectorAll(sel) {
+      if (sel !== '.dg-top10-item') { return []; }
+      const items = [];
+      const re = /data-hex="(\d+)"/g;
+      let m;
+      while ((m = re.exec(this.innerHTML))) {
+        const li = {
+          _hex: m[1], _h: {},
+          getAttribute() { return this._hex; },
+          addEventListener(ev, fn) { (this._h[ev] = this._h[ev] || []).push(fn); },
+          fire(ev) { (this._h[ev] || []).forEach(fn => fn()); },
+        };
+        items.push(li);
+      }
+      this._items = items;
+      return items;
+    },
+  };
+}
+const els = {
+  'dg-hex-data': { textContent: JSON.stringify(BLOCK) },
+  'dg-tab-podium': El('dg-tab-podium'),
+  'dg-tab-top10': El('dg-tab-top10'),
+  'dg-tab-btn-podium': El('dg-tab-btn-podium'),
+  'dg-tab-btn-top10': El('dg-tab-btn-top10'),
+};
+const active = [];
+const flyCalls = [];
+let circlesCreated = 0;
+let invalidated = 0;
+const map = {
+  _click: null,
+  on(ev, fn) { if (ev === 'click') { this._click = fn; } },
+  removeLayer(layer) {
+    const p = active.indexOf(layer);
+    if (p >= 0) { active.splice(p, 1); }
+  },
+  flyTo(latlon, zoom) { flyCalls.push({ latlon: latlon, zoom: zoom }); },
+  getZoom() { return 7; },
+  invalidateSize() { invalidated += 1; },
+};
+globalThis.window = {
+  addEventListener(ev, fn) { if (ev === 'load') { fn(); } },
+};
+globalThis.document = { getElementById(id) { return els[id] || null; } };
+globalThis.L = {
+  circle(latlon, opts) {
+    circlesCreated += 1;
+    const layer = {
+      latlon: latlon, opts: opts,
+      addTo() { active.push(layer); return layer; },
+    };
+    return layer;
+  },
+};
+window[__MAP_ID__] = map;
+__RAIL_JS__
+
+function snapshot() {
+  const html = els['dg-tab-podium'].innerHTML;
+  const ranks = [];
+  const miles = [];
+  let m;
+  const rankRe = /dg-card-rank">#(\d+) of/g;
+  while ((m = rankRe.exec(html))) { ranks.push(parseInt(m[1], 10)); }
+  const mileRe = /dg-card-miles">([0-9.]+) /g;
+  while ((m = mileRe.exec(html))) { miles.push(m[1]); }
+  return {
+    html: html,
+    cards: (html.match(/dg-card-rank/g) || []).length,
+    ranks: ranks,
+    miles: miles,
+    selected: (html.match(/dg-rail-card-selected/g) || []).length,
+    activeHighlights: active.length,
+  };
+}
+
+const out = {};
+map._click({ latlng: { lat: CLICKS.top1[0], lng: CLICKS.top1[1] } });
+out.top1 = snapshot();
+map._click({ latlng: { lat: CLICKS.mid[0], lng: CLICKS.mid[1] } });
+out.mid = snapshot();
+map._click({ latlng: { lat: CLICKS.last[0], lng: CLICKS.last[1] } });
+out.last = snapshot();
+els['dg-tab-podium'].innerHTML = 'UNTOUCHED';
+out.activeBeforeOff = active.length;
+map._click({ latlng: { lat: CLICKS.off[0], lng: CLICKS.off[1] } });
+out.off = snapshot();
+els['dg-tab-top10']._items[0].fire('click');
+out.top10 = snapshot();
+out.flyCalls = flyCalls;
+out.circlesCreated = circlesCreated;
+out.invalidated = invalidated;
+console.log(JSON.stringify(out));
+"""
+
+
+def _run_rail_harness(tmp_path, name, block, clicks, rail_js):
+    map_id_match = re.search(r"window\['(map_[A-Za-z0-9_]+)'\]", rail_js)
+    assert map_id_match, "could not find the folium map id in the rail script"
+    source = _RAIL_HARNESS
+    source = source.replace("__BLOCK__", json.dumps(block))
+    source = source.replace("__CLICKS__", json.dumps(clicks))
+    source = source.replace("__MAP_ID__", json.dumps(map_id_match.group(1)))
+    source = source.replace("__RAIL_JS__", rail_js)
+    path = tmp_path / f"rail_harness_{name}.js"
+    path.write_text(source)
+    proc = subprocess.run(["node", str(path)], capture_output=True, text=True, check=True)
+    return json.loads(proc.stdout)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_rail_js_end_to_end_in_node(tmp_path, geom, stores, result, tiny_hex_ranking):
+    ranking = tiny_hex_ranking
+    html_out = build_map(
+        geom, stores, result, tmp_path / "js.html",
+        hex_ranking=ranking, raster_png=tmp_path / "r.png",
+        store_display={},
+    ).read_text()
+    block = _extract_block(html_out)
+    rail_js = _extract_rail_script(html_out)
+    dec = _decode_block(block)
+    c = dec["click"]
+
+    def resolve(lat, lon):
+        i = math.floor((lat - c["lat_min"]) / c["cell_deg"])
+        j = math.floor((lon - c["lon_min"]) / c["cell_deg"])
+        if i < 0 or i >= c["lat_cells"] or j < 0 or j >= c["lon_cells"]:
+            return _CLICK_SENTINEL
+        return int(dec["click_idx"][i * c["lon_cells"] + j])
+
+    def center(h):
+        lat, lon = ranking.centers_latlon[h]
+        return [float(lat), float(lon)]
+
+    top1 = int(block["top10"][0])
+    assert resolve(*center(top1)) == top1
+    mid_hex = int(ranking.by_rank(ranking.ranks // 2))
+    mid_resolved = resolve(*center(mid_hex))
+    assert mid_resolved != _CLICK_SENTINEL
+    k_mid = int(dec["rank_of"][mid_resolved])
+    assert 1 < k_mid < ranking.ranks
+
+    clicks = {
+        "top1": center(top1),
+        "mid": center(mid_hex),
+        "last": center(int(ranking.by_rank(ranking.ranks))),
+        "off": [c["lat_min"] - 1.0, c["lon_min"] - 1.0],
+    }
+    out = _run_rail_harness(tmp_path, "real", block, clicks, rail_js)
+
+    # (a) Mid-rank click: three cards in order k-1 / k / k+1, selected middle.
+    mid = out["mid"]
+    assert mid["cards"] == 3
+    assert mid["ranks"] == [k_mid - 1, k_mid, k_mid + 1]
+    assert mid["selected"] == 1
+    cards_html = mid["html"].split('<div class="dg-rail-card')[1:]
+    assert len(cards_html) == 3
+    assert "dg-rail-card-selected" in cards_html[1]
+    assert "dg-rail-card-selected" not in cards_html[0]
+    assert "dg-rail-card-selected" not in cards_html[2]
+    assert len(mid["miles"]) == 3
+    assert all(re.fullmatch(r"\d+\.\d{2}", m) for m in mid["miles"])
+    assert mid["activeHighlights"] == 1
+
+    # (b) Rank-1 click: selected + one worse neighbor; never #0.
+    top1_snap = out["top1"]
+    assert top1_snap["cards"] == 2
+    assert top1_snap["ranks"] == [1, 2]
+    assert "#0 of" not in top1_snap["html"]
+    assert f"#{ranking.ranks + 1} of" not in top1_snap["html"]
+
+    # (b') Rank-N click: one better neighbor + selected; never #N+1.
+    last_snap = out["last"]
+    assert last_snap["cards"] == 2
+    assert last_snap["ranks"] == [ranking.ranks - 1, ranking.ranks]
+    assert f"#{ranking.ranks + 1} of" not in last_snap["html"]
+    assert top1_snap["selected"] == 1 and last_snap["selected"] == 1
+
+    # (c) Off-state click: rail untouched, no new highlight.
+    assert out["off"]["html"] == "UNTOUCHED"
+    assert out["off"]["activeHighlights"] == out["activeBeforeOff"]
+
+    # (d) Top-10 row: one flyTo with a useful zoom, exactly one highlight.
+    assert len(out["flyCalls"]) == 1
+    assert out["flyCalls"][0]["zoom"] >= 11
+    assert out["top10"]["activeHighlights"] == 1
+    assert out["circlesCreated"] >= 4  # one per show; replaced, never stacked
+    assert out["invalidated"] == 1
+
+    # Sentinel branch itself: mask the mid cell, then an in-grid click there
+    # must leave the rail (and highlight) untouched.
+    idx = dec["click_idx"].copy()
+    i = math.floor((clicks["mid"][0] - c["lat_min"]) / c["cell_deg"])
+    j = math.floor((clicks["mid"][1] - c["lon_min"]) / c["cell_deg"])
+    idx[i * c["lon_cells"] + j] = _CLICK_SENTINEL
+    masked = json.loads(json.dumps(block))
+    masked["click"]["idx"] = base64.b64encode(idx.astype("<u4").tobytes()).decode("ascii")
+    out2 = _run_rail_harness(tmp_path, "sentinel", masked, clicks, rail_js)
+    assert out2["mid"]["html"] == out2["top1"]["html"]
+    assert out2["mid"]["activeHighlights"] == out2["top1"]["activeHighlights"]

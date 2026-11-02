@@ -449,6 +449,36 @@ def _ramp_color(distance_norm: np.ndarray) -> np.ndarray:
     return np.concatenate([rgb, alpha], axis=-1)
 
 
+def raster_image_bounds(
+    centers_m: np.ndarray, hex_across_m: float
+) -> tuple[float, float, float, float]:
+    """``(lat_min, lon_min, lat_max, lon_max)`` of the rendered raster image.
+
+    The image covers the EPSG:6575 bounds of the hex vertices (a superset of
+    the centers), so the four projected corners are back-projected to WGS84
+    and their envelope returned. This is the single source of truth for both
+    :func:`render_remoteness_png` (the :class:`RemotenessRaster` contract) and
+    the ``folium`` ``ImageOverlay`` registration, so the two can never drift.
+    """
+    verts = hex_vertices_m(centers_m, hex_across_m)
+    minx = float(verts[..., 0].min())
+    maxx = float(verts[..., 0].max())
+    miny = float(verts[..., 1].min())
+    maxy = float(verts[..., 1].max())
+    to_wgs84 = pyproj.Transformer.from_crs("EPSG:6575", "EPSG:4326", always_xy=True)
+    corner_lons, corner_lats = to_wgs84.transform(
+        [minx, minx, maxx, maxx], [miny, maxy, maxy, miny]
+    )
+    corner_lons = np.asarray(corner_lons, dtype=np.float64)
+    corner_lats = np.asarray(corner_lats, dtype=np.float64)
+    return (
+        float(corner_lats.min()),
+        float(corner_lons.min()),
+        float(corner_lats.max()),
+        float(corner_lons.max()),
+    )
+
+
 def render_remoteness_png(
     hex_ranking: HexRanking,
     output_path: Path | str,
@@ -523,18 +553,9 @@ def render_remoteness_png(
 
     # Back-project the four corners of the projected (EPSG:6575) pixel extent
     # to WGS84 lat/lon — exactly what the image covers as drawn.
-    to_wgs84 = pyproj.Transformer.from_crs("EPSG:6575", "EPSG:4326", always_xy=True)
-    corner_lons, corner_lats = to_wgs84.transform(
-        [minx, minx, maxx, maxx], [miny, maxy, maxy, miny]
-    )
-    corner_lons = np.asarray(corner_lons, dtype=np.float64)
-    corner_lats = np.asarray(corner_lats, dtype=np.float64)
     return RemotenessRaster(
         path=output_path,
-        image_bounds_latlon=(
-            float(corner_lats.min()),
-            float(corner_lons.min()),
-            float(corner_lats.max()),
-            float(corner_lons.max()),
+        image_bounds_latlon=raster_image_bounds(
+            hex_ranking.centers_m, hex_ranking.hex_across_m
         ),
     )

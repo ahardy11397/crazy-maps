@@ -8,8 +8,6 @@ from pathlib import Path
 
 import branca.element
 import folium
-import numpy as np
-import pyproj
 import shapely
 from folium import raster_layers
 
@@ -19,7 +17,7 @@ from tn_dollar_general.hexgrid import (
     HexRanking,
     build_click_table,
     encode_data_block,
-    hex_vertices_m,
+    raster_image_bounds,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,20 +28,6 @@ _RAIL_WIDTH_PX = 340
 _RAIL_RESERVED_PX = 350
 
 
-def _rail_escape(text: str) -> str:
-    """Sanitize text for the rail's JSON payload / innerHTML rendering.
-
-    Mirrors :func:`_safe_tooltip`: html.escape on plain strings, plus
-    neutralized backticks and ``$`` so HTML payloads and ``${...}``-style
-    interpolation cannot survive into the baked HTML. The escaped form is
-    decoded back to visible text when the JS injects it via innerHTML, so
-    the display is unaffected.
-    """
-    escaped = html.escape(text, quote=True)
-    escaped = escaped.replace("`", "&#96;").replace("$", "&#36;")
-    return escaped
-
-
 def _safe_tooltip(text: str) -> str:
     """Sanitize text for use as a folium Tooltip label.
 
@@ -51,11 +35,24 @@ def _safe_tooltip(text: str) -> str:
     literal inside a <script> block (and Leaflet inserts the rendered span
     via innerHTML), so HTML payloads, backticks, and ${...} interpolation
     must all be neutralized. Entities are decoded when Leaflet hydrates the
-    tooltip, so the visible text is unaffected.
+    tooltip, so the visible text is unaffected. Also the shared implementation
+    behind :func:`_rail_escape`.
     """
     escaped = html.escape(text, quote=True)
     escaped = escaped.replace("`", "&#96;").replace("$", "&#36;")
     return escaped
+
+
+def _rail_escape(text: str) -> str:
+    """Sanitize text for the rail's JSON payload / innerHTML rendering.
+
+    Single shared escaping implementation with :func:`_safe_tooltip`: both
+    contexts inject text into inline HTML (folium tooltips and the rail's
+    ``innerHTML``), so HTML payloads, backticks and ``${...}`` interpolation
+    must all be neutralized. Entities are decoded back to visible text at the
+    call sites, so the display is unaffected.
+    """
+    return _safe_tooltip(text)
 
 
 def _bearing_to_compass(bearing: float) -> str:
@@ -256,43 +253,19 @@ def _store_display_string(store: StoreRecord, address: str | None) -> str:
     return display
 
 
-def _raster_image_bounds(hex_ranking: HexRanking) -> tuple[float, float, float, float]:
-    """``(lat_min, lon_min, lat_max, lon_max)`` of the raster's pixel extent.
-
-    Replicates ``render_remoteness_png``'s own registration math (EPSG:6575
-    bounds of the hex vertices, back-projected at the four corners) so the
-    overlay is pinned to the PNG image itself rather than the clip rect.
-    Keep in sync with that function.
-    """
-    verts = hex_vertices_m(hex_ranking.centers_m, hex_ranking.hex_across_m)
-    minx = float(verts[..., 0].min())
-    maxx = float(verts[..., 0].max())
-    miny = float(verts[..., 1].min())
-    maxy = float(verts[..., 1].max())
-    to_wgs84 = pyproj.Transformer.from_crs("EPSG:6575", "EPSG:4326", always_xy=True)
-    corner_lons, corner_lats = to_wgs84.transform(
-        [minx, minx, maxx, maxx], [miny, maxy, maxy, miny]
-    )
-    corner_lats = np.asarray(corner_lats, dtype=np.float64)
-    corner_lons = np.asarray(corner_lons, dtype=np.float64)
-    return (
-        float(corner_lats.min()),
-        float(corner_lons.min()),
-        float(corner_lats.max()),
-        float(corner_lons.max()),
-    )
-
-
 def _add_raster_layer(m: folium.Map, hex_ranking: HexRanking, raster_png: Path | str) -> None:
     """Bake exactly ONE raster: the remoteness PNG as a data: URI overlay.
 
     Added first, before every other layer, so all later layers render above
-    it. Bounds come from the raster's own image extent in Leaflet order
-    ``[[lat_min, lon_min], [lat_max, lon_max]]``.
+    it. Bounds come from :func:`tn_dollar_general.hexgrid.raster_image_bounds`
+    — the same registration math :func:`render_remoteness_png` uses — in
+    Leaflet order ``[[lat_min, lon_min], [lat_max, lon_max]]``.
     """
     png_bytes = Path(raster_png).read_bytes()
     data_uri = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
-    lat_min, lon_min, lat_max, lon_max = _raster_image_bounds(hex_ranking)
+    lat_min, lon_min, lat_max, lon_max = raster_image_bounds(
+        hex_ranking.centers_m, hex_ranking.hex_across_m
+    )
     marker = (
         "<!-- Remoteness hex field baked as exactly one folium.raster_layers."
         "ImageOverlay (the pinned anti-goal: never per-hex vector layers) -->\n"
@@ -386,6 +359,13 @@ _RAIL_CSS_TEMPLATE = """
 .dg-card-miles .dg-miles-unit { font-size: 13px; font-weight: 600; color: #64748b; }
 .dg-card-store { font-size: 12.5px; font-weight: 600; color: #0f172a; margin-top: 4px; }
 .dg-card-addr { font-size: 11px; color: #475569; margin-top: 2px; line-height: 1.35; }
+/* Selected hexagon card: emphasized against its rank-neighbors. */
+.dg-rail-card.dg-rail-card-selected {
+    border-left-width: 7px;
+    border-color: #dc2626;
+    background: #fff7f7;
+    box-shadow: 0 6px 14px -6px rgba(220, 38, 38, 0.55);
+}
 .dg-top10-list { list-style: none; margin: 0; padding: 0; }
 .dg-top10-item {
     background: #fff;
@@ -462,6 +442,8 @@ _RAIL_JS_TEMPLATE = """
         var centersQ = u16List(data.centers);
         var click = data.click;
         var clip = data.clip;
+        // Decoded once at load: the click handler must not re-decode per click.
+        var clickIdx = u32List(click.idx);
 
         function centerLatLon(h) {
             return [
@@ -501,18 +483,19 @@ _RAIL_JS_TEMPLATE = """
                 interactive: false,
             });
             highlight.addTo(map);
-            if (doFly) { map.flyTo(latlon); }
+            if (doFly) { map.flyTo(latlon, Math.max(map.getZoom(), 11)); }
         }
 
         // Store text arrives in the data block already escaped by the builder;
         // it is concatenated (never through a template literal) and inserted
         // via innerHTML so the browser decodes entities to visible text.
-        function cardHtml(h) {
+        function cardHtml(h, isSelected) {
             var s = data.stores[storeIdx[h]];
             var nm = s && s.name ? s.name : 'Dollar General';
             var addr = s && s.address ? s.address : '';
             var addrLine = addr ? addr : 'no address on record';
-            return '<div class="dg-rail-card">'
+            return '<div class="dg-rail-card'
+                + (isSelected ? ' dg-rail-card-selected' : '') + '">'
                 + '<div class="dg-card-rank">#' + rankOf[h] + ' of ' + NHexes + ' hexes</div>'
                 + '<div class="dg-card-miles">' + (distMiQ[h] / 1000).toFixed(2)
                 + ' <span class="dg-miles-unit">mi</span></div>'
@@ -523,7 +506,16 @@ _RAIL_JS_TEMPLATE = """
 
         function showHexCard(h, doFly) {
             switchTab('podium');
-            elPodium.innerHTML = cardHtml(h);
+            // Podium: the selected hexagon plus its one-better and one-worse
+            // rank-neighbors (spec §2). rankOrder[r] is the hex at rank r+1,
+            // so rank k-1 sits at index k-2 and rank k+1 at index k. End ranks
+            // omit the missing neighbor entirely — never #0 or #N+1.
+            var k = rankOf[h];
+            var cards = [];
+            if (k > 1) { cards.push(cardHtml(rankOrder[k - 2], false)); }
+            cards.push(cardHtml(h, true));
+            if (k < NHexes) { cards.push(cardHtml(rankOrder[k], false)); }
+            elPodium.innerHTML = cards.join('');
             pulse(centerLatLon(h), doFly);
         }
 
@@ -531,8 +523,7 @@ _RAIL_JS_TEMPLATE = """
             var i = Math.floor((e.latlng.lat - click.lat_min) / click.cell_deg);
             var j = Math.floor((e.latlng.lng - click.lon_min) / click.cell_deg);
             if (i < 0 || i >= click.lat_cells || j < 0 || j >= click.lon_cells) { return; }
-            var dv = new DataView(b64ToU8(click.idx).buffer);
-            var h = dv.getUint32((i * click.lon_cells + j) * 4, true);
+            var h = clickIdx[i * click.lon_cells + j];
             if (h === SENTINEL) { return; }  // off-state: leave the rail untouched
             showHexCard(h, false);
         });
@@ -557,8 +548,13 @@ _RAIL_JS_TEMPLATE = """
                 });
             })(items[a]);
         }
+
+        // The CSS narrows the map container after Leaflet sized itself on
+        // load; re-measure once so tiles/controls match the reserved column.
+        map.invalidateSize();
     });
 })();
+</script>
 """
 
 
