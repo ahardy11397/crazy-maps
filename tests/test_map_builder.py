@@ -226,6 +226,23 @@ def test_build_map_default_basemap_is_openstreetmap_without_keyed_tiles(tmp_path
     assert "cartocdn.com" not in html_text
 
 
+class _FakeNominatimClient:
+    """Offline stand-in for the Nominatim client: fixed address, no network, no sleep."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def reverse(self, lat: float, lon: float) -> dict:
+        return {
+            "address": {
+                "house_number": "1",
+                "road": "Fake Rd",
+                "city": "Franklin",
+                "state": "TN",
+            }
+        }
+
+
 def test_run_pipeline_creates_outputs_and_summary_json(tmp_path: Path):
     poly = box(-86.1, 35.7, -85.9, 35.9)
     stores = [
@@ -265,14 +282,18 @@ def test_run_pipeline_creates_outputs_and_summary_json(tmp_path: Path):
 
     with patch("main.fetch_tn_boundary", return_value=poly), patch(
         "main.fetch_dollar_generals", return_value=stores
+    ), patch(
+        "tn_dollar_general.data_fetcher.HTTPNominatimClient", _FakeNominatimClient
     ):
         result = main.run_pipeline(data_dir=data_dir, output_dir=output_dir, refresh=False)
 
-    assert (output_dir / "tn_dollar_general_map.html").exists()
+    map_output_path = output_dir / "tn_dollar_general_map.html"
+    assert map_output_path.exists()
     summary_path = output_dir / "summary.json"
     assert summary_path.exists()
 
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary_data = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary = summary_data
     assert summary["total_tn_stores"] == 2
     assert summary["total_border_buffer_stores"] == 1
     assert "coordinates" in summary
@@ -284,6 +305,28 @@ def test_run_pipeline_creates_outputs_and_summary_json(tmp_path: Path):
     assert len(summary["nearest_stores"]) > 0
     assert summary["coordinates"]["lat"] == result.lat
     assert summary["coordinates"]["lon"] == result.lon
+
+    # The pipeline also builds the 1 km hex ranking, enriches addresses, and
+    # renders the remoteness raster, then bakes them into the map.
+    assert (output_dir / "remoteness.png").exists()
+    assert (output_dir / "remoteness.png").stat().st_size > 0
+    html_out = map_output_path.read_text()
+    assert 'id="dg-hex-data"' in html_out
+    assert "Top 10 Most Remote" in html_out
+    # The real enrichment path ran (offline fake client) and wrote its cache.
+    address_cache = data_dir / "store_addresses.json"
+    assert address_cache.exists()
+    assert set(json.loads(address_cache.read_text())["addresses"]) == {"1", "2", "3"}
+
+    block = _extract_block(html_out)
+    assert block["totals"]["hexes"] > 0
+
+    # summary.json's top-level contract stays exactly as it is today:
+    assert set(summary_data) == {
+        "state", "total_tn_stores", "total_border_buffer_stores",
+        "total_stores_analyzed", "coordinates", "distance_miles",
+        "distance_km", "distance_meters", "nearest_stores",
+    }
 
 
 # --- Task 6: side rail UI, raster overlay wiring, click handling -----------

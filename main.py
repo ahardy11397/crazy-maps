@@ -6,8 +6,13 @@ import logging
 from pathlib import Path
 import sys
 
-from tn_dollar_general.data_fetcher import fetch_tn_boundary, fetch_dollar_generals
+from tn_dollar_general.data_fetcher import (
+    enrich_store_addresses,
+    fetch_tn_boundary,
+    fetch_dollar_generals,
+)
 from tn_dollar_general.geometry import FurthestPointResult, find_furthest_point
+from tn_dollar_general.hexgrid import build_hex_ranking, render_remoteness_png
 from tn_dollar_general.map_builder import build_map
 
 logging.basicConfig(
@@ -28,9 +33,12 @@ def run_pipeline(
     1. Fetch / load Tennessee state boundary.
     2. Fetch / load Dollar General stores (Tennessee + 50km buffer).
     3. Compute the exact furthest point inside Tennessee using Voronoi + geodesic optimization.
-    4. Render the interactive Folium HTML map.
-    5. Write the summary JSON file.
-    6. Print a formatted summary report.
+    4. Build the 1 km hex lattice and rank every in-state hex by remoteness.
+    5. Enrich store addresses (own data first, Nominatim fallback, id-keyed cache).
+    6. Render the remoteness hex field to a single transparent PNG.
+    7. Render the interactive Folium HTML map (raster overlay + side rail).
+    8. Write the summary JSON file.
+    9. Print a formatted summary report.
     """
     data_dir = Path(data_dir)
     output_dir = Path(output_dir)
@@ -40,12 +48,12 @@ def run_pipeline(
 
     # 1. Fetch boundary
     boundary_cache = data_dir / "tn_boundary.geojson"
-    logger.info("Step 1/5: Loading Tennessee state boundary (%s)...", boundary_cache)
+    logger.info("Step 1/9: Loading Tennessee state boundary (%s)...", boundary_cache)
     tn_geom = fetch_tn_boundary(cache_path=boundary_cache, refresh=refresh)
 
     # 2. Fetch Dollar General locations
     stores_cache = data_dir / "dollar_generals.geojson"
-    logger.info("Step 2/5: Loading Dollar General store locations (%s)...", stores_cache)
+    logger.info("Step 2/9: Loading Dollar General store locations (%s)...", stores_cache)
     stores = fetch_dollar_generals(
         tn_geom=tn_geom,
         cache_path=stores_cache,
@@ -56,17 +64,39 @@ def run_pipeline(
     logger.info("Loaded %d Dollar Generals (%d in TN, %d in border buffer)", len(stores), total_tn, total_border)
 
     # 3. Compute furthest point
-    logger.info("Step 3/5: Computing exact furthest point via Voronoi and WGS84 geodesic optimization...")
+    logger.info("Step 3/9: Computing exact furthest point via Voronoi and WGS84 geodesic optimization...")
     result = find_furthest_point(tn_geom=tn_geom, stores=stores)
 
-    # 4. Generate interactive map
-    map_output_path = output_dir / "tn_dollar_general_map.html"
-    logger.info("Step 4/5: Rendering interactive Folium map to %s...", map_output_path)
-    build_map(tn_geom=tn_geom, stores=stores, result=result, output_path=map_output_path)
+    # 4. Build and rank the 1 km hex lattice
+    logger.info("Step 4/9: Ranking 1 km hexes by remoteness from the nearest store...")
+    hex_ranking = build_hex_ranking(tn_geom=tn_geom, stores=stores)
 
-    # 5. Write summary JSON
+    # 5. Enrich store addresses (cached; Nominatim only for incomplete stores)
+    address_cache = data_dir / "store_addresses.json"
+    logger.info("Step 5/9: Enriching store addresses (%s)...", address_cache)
+    store_display = enrich_store_addresses(stores, address_cache, refresh=refresh)
+
+    # 6. Render the remoteness raster (one PNG, never vector hexes)
+    raster_png = output_dir / "remoteness.png"
+    logger.info("Step 6/9: Rendering remoteness raster to %s...", raster_png)
+    raster = render_remoteness_png(hex_ranking, raster_png)
+
+    # 7. Generate interactive map
+    map_output_path = output_dir / "tn_dollar_general_map.html"
+    logger.info("Step 7/9: Rendering interactive Folium map to %s...", map_output_path)
+    build_map(
+        tn_geom=tn_geom,
+        stores=stores,
+        result=result,
+        output_path=map_output_path,
+        hex_ranking=hex_ranking,
+        raster_png=raster.path,
+        store_display=store_display,
+    )
+
+    # 8. Write summary JSON
     summary_path = output_dir / "summary.json"
-    logger.info("Step 5/5: Writing summary JSON to %s...", summary_path)
+    logger.info("Step 8/9: Writing summary JSON to %s...", summary_path)
     summary_data = {
         "state": "Tennessee",
         "total_tn_stores": total_tn,

@@ -22,10 +22,19 @@ OpenStreetMap constantly, so results will drift over time.
    boundary samples, and a 1 km interior grid), then local refinement of the top
    candidates on the exact **WGS84 ellipsoid** via Nelder-Mead. The reported optimum
    is audited against a dense verification grid per spec §4.3.
-4. **Map** — a self-contained Folium HTML file with layers for the state boundary,
+4. **Remoteness field** — builds the 1 km across-flats hex lattice inside the
+   state, ranks every hex by distance to its nearest store, enriches store
+   addresses (own data first, Nominatim fallback, id-keyed cache in
+   `data/store_addresses.json`), and renders the ranked field to a single
+   transparent `output/remoteness.png` overlay.
+5. **Map** — a self-contained Folium HTML file with layers for the state boundary,
    in-TN / border stores, the largest empty circle, dashed lines to the three
-   constraining stores, and popups linking each store to OpenStreetMap. A summary
-   JSON (`output/summary.json`) is written alongside.
+   constraining stores, popups linking each store to OpenStreetMap, and the
+   remoteness raster. A side rail adds a Podium 3-card click view (the clicked
+   hex plus its better/worse neighbours) and a Top 10 Most Remote tab. A summary
+   JSON (`output/summary.json`) is written alongside. See
+   [`docs/superpowers/specs/2026-10-31-hex-remoteness-ranking-design.md`](docs/superpowers/specs/2026-10-31-hex-remoteness-ranking-design.md)
+   for the full design.
 
 ## Install
 
@@ -48,6 +57,7 @@ Optional flags: `--data-dir DIR` (default `data/`) and `--output-dir DIR`
 Outputs:
 
 - `output/tn_dollar_general_map.html` — open in any browser, no server needed
+- `output/remoteness.png` — the ranked 1 km hex remoteness raster baked into the map
 - `output/summary.json` — machine-readable result (coordinates, distances, nearest stores)
 
 ## Development
