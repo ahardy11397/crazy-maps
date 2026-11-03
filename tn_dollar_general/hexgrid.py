@@ -422,9 +422,9 @@ class RemotenessRaster:
     """Result of :func:`render_remoteness_png`.
 
     ``image_bounds_latlon`` is ``(lat_min, lon_min, lat_max, lon_max)`` of the
-    rendered pixel extent (back-projected from the hex-vertex bounds in
-    projected EPSG:6575 metres), so Task 6 can pin ``folium``'s
-    ``ImageOverlay`` to the image itself rather than the clip rect.
+    rendered pixel extent (the WGS84 corners of the hex-vertex bbox drawn in
+    EPSG:3857, the same CRS the raster is rendered in), so Task 6 can pin
+    ``folium``'s ``ImageOverlay`` to the image itself rather than the clip rect.
     """
 
     path: Path
@@ -449,23 +449,43 @@ def _ramp_color(distance_norm: np.ndarray) -> np.ndarray:
     return np.concatenate([rgb, alpha], axis=-1)
 
 
+def _vertex_bbox_3857(
+    centers_m: np.ndarray, hex_across_m: float
+) -> tuple[float, float, float, float]:
+    """``(min_x, min_y, max_x, max_y)`` EPSG:3857 bbox of the hex vertices.
+
+    Every vertex is transformed EPSG:6575 -> EPSG:3857 and the min/max taken
+    (the transform is conformal plus a datum shift, so per-vertex coordinates
+    are needed to bound the drawn extent exactly). One vectorized pass over
+    the flat (6N, 2) vertex array.
+    """
+    verts = hex_vertices_m(centers_m, hex_across_m).reshape(-1, 2)
+    to_3857 = pyproj.Transformer.from_crs("EPSG:6575", "EPSG:3857", always_xy=True)
+    xs, ys = to_3857.transform(verts[:, 0], verts[:, 1])
+    xs = np.asarray(xs, dtype=np.float64)
+    ys = np.asarray(ys, dtype=np.float64)
+    return float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
+
+
 def raster_image_bounds(
     centers_m: np.ndarray, hex_across_m: float
 ) -> tuple[float, float, float, float]:
     """``(lat_min, lon_min, lat_max, lon_max)`` of the rendered raster image.
 
-    The image covers the EPSG:6575 bounds of the hex vertices (a superset of
-    the centers), so the four projected corners are back-projected to WGS84
-    and their envelope returned. This is the single source of truth for both
-    :func:`render_remoteness_png` (the :class:`RemotenessRaster` contract) and
-    the ``folium`` ``ImageOverlay`` registration, so the two can never drift.
+    The raster is *rendered* in EPSG:3857 — the CRS of the target map — so
+    its pixel extent covers the EPSG:3857 bbox of the hex vertices (a
+    superset of the centers). ``Leaflet``/``folium`` draw an ``ImageOverlay``
+    as an axis-aligned rectangle that is linear in longitude and linear in
+    *Mercator* latitude, so registering the image via the four 3857 corners
+    inverse-transformed to WGS84 is exact: x↔lon is linear and y↔Mercator
+    lat is strictly monotonic, leaving no room for the 6575-vs-3857
+    parameterization warp. This is the single source of truth for both
+    :func:`render_remoteness_png` (the :class:`RemotenessRaster` contract)
+    and the ``folium`` ``ImageOverlay`` registration, so the two can never
+    drift.
     """
-    verts = hex_vertices_m(centers_m, hex_across_m)
-    minx = float(verts[..., 0].min())
-    maxx = float(verts[..., 0].max())
-    miny = float(verts[..., 1].min())
-    maxy = float(verts[..., 1].max())
-    to_wgs84 = pyproj.Transformer.from_crs("EPSG:6575", "EPSG:4326", always_xy=True)
+    minx, miny, maxx, maxy = _vertex_bbox_3857(centers_m, hex_across_m)
+    to_wgs84 = pyproj.Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
     corner_lons, corner_lats = to_wgs84.transform(
         [minx, minx, maxx, maxx], [miny, maxy, maxy, miny]
     )
@@ -488,31 +508,45 @@ def render_remoteness_png(
 
     Anti-goal honored: the browser consumes a single image — never thousands of
     vector hex shapes. Exactly one ``matplotlib`` ``PolyCollection`` carries
-    every hexagon from ``hex_vertices_m`` with facecolors from the pinned ramp
-    (:func:`_ramp_color`) over ``distance / max(distance)``.
+    every hexagon with facecolors from the pinned ramp (:func:`_ramp_color`)
+    over ``distance / max(distance)``.
 
-    Geometry: the image spans the bounds of the hex vertices themselves (a
-    superset of the projected EPSG:6575 bounds, so no hexagon is clipped at an
-    image edge) at the true projected-meters aspect; ``axes`` fill the figure
-    edge to edge with no ticks or frame. Edges are drawn un-antialiased in each
-    hexagon's own face color, so adjacent hexes share exact boundary pixels and
-    pixel alpha is exactly 1.0 inside the hex field and 0 outside it.
+    CRS: the image is drawn in **EPSG:3857** — the CRS of the target map —
+    because ``Leaflet``/``folium`` stretch an ``ImageOverlay`` linearly in
+    longitude and linearly in *Mercator* latitude. Hex vertices are
+    transformed EPSG:6575 → EPSG:3857 (vectorized) and the ``PolyCollection``
+    drawn in 3857 coordinates with the axes limits set to the 3857 vertex
+    bbox (a superset of the centers, so no hexagon is clipped at an image
+    edge); the figure fills edge to edge with no ticks or frame. This makes a
+    rectangular registration exact, versus the kilometres of parameterization
+    warp a 6575-linear draw would incur under Leaflet's mapping. Edges are
+    drawn un-antialiased in each hexagon's own face color, so adjacent hexes
+    share exact boundary pixels and pixel alpha is exactly 1.0 inside the hex
+    field and 0 outside it.
 
-    Pixel size: ``px_per_hex`` pixels per across-flats hexagon span
-    (``px_per_hex`` px per km at the pinned 1000 m default), brokered through a
-    fixed 100 dpi canvas. When that scale would floor the shorter image side
-    below :data:`_MIN_RASTER_SIDE_PX` (tiny build extents), the scale is raised
-    to the floor instead — never lowered at state scale.
+    Pixel size: ``px_per_hex`` pixels per across-flats hexagon span, measured
+    in 3857 units (``hex_across_m`` rescaled by the 3857/6575 x-span ratio —
+    Mercator stretches ~1.22x at TN latitudes). When that scale would floor
+    the shorter image side below :data:`_MIN_RASTER_SIDE_PX` (tiny build
+    extents), the scale is raised to the floor instead — never lowered at
+    state scale.
 
     Returns a :class:`RemotenessRaster` whose ``image_bounds_latlon`` are the
-    lat/lon bounds of the rendered pixel extent itself (the back-projection of
-    the hex-vertex spans the image covers, not the data block's clip rect), so
-    the ``folium`` ``ImageOverlay`` can register the PNG on the map exactly.
+    lat/lon bounds of the rendered pixel extent itself (the inverse transform
+    of the drawn 3857 vertex bbox the image covers, not the data block's clip
+    rect), so the ``folium`` ``ImageOverlay`` can register the PNG on the map
+    exactly and at zero warping.
     """
     if px_per_hex <= 0:
         raise ValueError(f"px_per_hex must be positive, got {px_per_hex}")
 
-    verts = hex_vertices_m(hex_ranking.centers_m, hex_ranking.hex_across_m)
+    verts6575 = hex_vertices_m(hex_ranking.centers_m, hex_ranking.hex_across_m)
+    to_3857 = pyproj.Transformer.from_crs("EPSG:6575", "EPSG:3857", always_xy=True)
+    flat = verts6575.reshape(-1, 2)
+    xs3857, ys3857 = to_3857.transform(flat[:, 0], flat[:, 1])
+    verts = np.column_stack(
+        [np.asarray(xs3857), np.asarray(ys3857)]
+    ).reshape(verts6575.shape)
     minx = float(verts[..., 0].min())
     maxx = float(verts[..., 0].max())
     miny = float(verts[..., 1].min())
@@ -522,11 +556,17 @@ def render_remoteness_png(
     dmax = float(distance.max()) if distance.size else 0.0
     distance_norm = distance / dmax if dmax > 0.0 else np.zeros_like(distance)
 
-    # Builder scale: px_per_hex px per hexagon-across, floored on the shorter
-    # side for very small extents (test fixtures); never lowered at state scale.
-    min_span = min(maxx - minx, maxy - miny)
-    scale = max(px_per_hex / hex_ranking.hex_across_m, _MIN_RASTER_SIDE_PX / min_span)
-    width_px = int(round((maxx - minx) * scale))
+    # Builder scale: px_per_hex px per hexagon-across, measured in the 3857
+    # units actually drawn (Mercator stretches x ~1.22x at TN latitudes, so
+    # the hex-across is rescaled by the 3857/6575 x-span ratio to keep the
+    # px/hex intent), floored on the shorter side for very small extents
+    # (test fixtures); never lowered at state scale.
+    span_x_6575 = float(verts6575[..., 0].max() - verts6575[..., 0].min())
+    span_x_3857 = maxx - minx
+    hex_across_3857 = hex_ranking.hex_across_m * (span_x_3857 / span_x_6575)
+    min_span = min(span_x_3857, maxy - miny)
+    scale = max(px_per_hex / hex_across_3857, _MIN_RASTER_SIDE_PX / min_span)
+    width_px = int(round(span_x_3857 * scale))
     height_px = int(round((maxy - miny) * scale))
 
     fig = matplotlib.pyplot.figure(
@@ -551,8 +591,9 @@ def render_remoteness_png(
     finally:
         matplotlib.pyplot.close(fig)
 
-    # Back-project the four corners of the projected (EPSG:6575) pixel extent
-    # to WGS84 lat/lon — exactly what the image covers as drawn.
+    # The pixel extent drawn is exactly the EPSG:3857 vertex bbox; register
+    # its corners (inverse-transformed to WGS84) — exactly what the image
+    # covers as drawn.
     return RemotenessRaster(
         path=output_path,
         image_bounds_latlon=raster_image_bounds(

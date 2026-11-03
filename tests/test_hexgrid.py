@@ -77,6 +77,23 @@ def _square_state_and_corner_stores() -> tuple[shapely.Geometry, list[StoreRecor
     return _SQUARE, stores
 
 
+def _tn_stores() -> list[StoreRecord]:
+    """5 stores spread across the full TN-scale box (see ``_TN_BOX``)."""
+    return [
+        StoreRecord(
+            id=str(idx),
+            name=f"TN Store #{idx}",
+            lat=lat,
+            lon=lon,
+            city=None,
+            street=None,
+            state=None,
+            in_tn=True,
+        )
+        for idx, (lat, lon) in enumerate(_TN_STORE_LATLONS, start=1)
+    ]
+
+
 _TO_PROJ = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:6575", always_xy=True)
 
 
@@ -379,11 +396,18 @@ def test_raster_image_bounds_latlon_track_projected_vertices(tmp_path):
     raster = render_remoteness_png(build_hex_ranking(geom, stores), tmp_path / "r.png")
     ranking = build_hex_ranking(geom, stores)
     verts = hex_vertices_m(ranking.centers_m, ranking.hex_across_m)
-    min_x, max_x = float(verts[..., 0].min()), float(verts[..., 0].max())
-    min_y, max_y = float(verts[..., 1].min()), float(verts[..., 1].max())
-    to_wgs84 = pyproj.Transformer.from_crs("EPSG:6575", "EPSG:4326", always_xy=True)
+    # Leaflet draws ImageOverlay as an axis-aligned rectangle linear in
+    # longitude and linear in *Mercator* latitude (EPSG:3857), so the declared
+    # bounds must be the 4326 envelope of the vertices' 3857 bbox, not of the
+    # 6575 bbox (different parameterizations -- see the state-scale test).
+    to_3857 = pyproj.Transformer.from_crs("EPSG:6575", "EPSG:3857", always_xy=True)
+    mx, my = to_3857.transform(verts[..., 0].ravel(), verts[..., 1].ravel())
+    mx = np.asarray(mx, dtype=np.float64)
+    my = np.asarray(my, dtype=np.float64)
+    to_wgs84 = pyproj.Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
     corner_lons, corner_lats = to_wgs84.transform(
-        [min_x, min_x, max_x, max_x], [min_y, max_y, max_y, min_y]
+        [float(mx.min()), float(mx.min()), float(mx.max()), float(mx.max())],
+        [float(my.min()), float(my.max()), float(my.max()), float(my.min())],
     )
     corner_lats = np.asarray(corner_lats, dtype=np.float64)
     corner_lons = np.asarray(corner_lons, dtype=np.float64)
@@ -396,3 +420,89 @@ def test_raster_image_bounds_latlon_track_projected_vertices(tmp_path):
     assert abs(lon_max - float(corner_lons.max())) <= 0.01
     # Ordering: (lat_min, lon_min) before (lat_max, lon_max).
     assert lat_min < lat_max and lon_min < lon_max
+
+
+# ---------------------------------------------------------------------------
+# State-scale overlay registration (Critical C1 regression guard)
+# ---------------------------------------------------------------------------
+
+# TN-shaped box ~8.6 deg lon x ~1.7 deg lat (35.0-36.7 N, -90.3 to -81.7 W),
+# i.e. near the full state extent -> ~150-175k pinned 1000 m hexes.
+_TN_BOX = box(-90.3, 35.0, -81.7, 36.7)
+
+_TN_STORE_LATLONS = [
+    (35.1, -90.0),
+    (35.2, -82.9),
+    (36.5, -88.1),
+    (36.4, -82.0),
+    (35.8, -86.5),
+]
+
+_TO_3857 = pyproj.Transformer.from_crs("EPSG:6575", "EPSG:3857", always_xy=True)
+_WGS_TO_MERC = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+_MERC_TO_WGS = pyproj.Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+
+
+def test_raster_registers_exactly_in_3857_at_state_scale(tmp_path):
+    """The PNG is drawn in EPSG:3857 and its declared bounds register it exactly.
+
+    Leaflet draws an ``ImageOverlay`` as an axis-aligned rectangle linear in
+    longitude and linear in *Mercator* latitude. The renderer must therefore
+    draw in EPSG:3857 and ``image_bounds_latlon`` must be the WGS84 corners of
+    the drawn 3857 vertex bbox; the older EPSG:6575-linear rendering warped and
+    shifted mid-state points by kilometres (Critical C1: the rank-1 hex drew
+    ~8.8 km from its true center).
+
+    Ground truth here is independent of the returned bounds: the PNG's edges
+    sit at the pinned renderer contract's hex-vertex bounds, projected to
+    3857. Each sampled hex center's *pixel fraction* is computed from those
+    true 3857 image edges, and we then ask where the declared lat/lon
+    rectangle (linear in x, linear in Mercator-y) draws that pixel fraction.
+    """
+    ranking = build_hex_ranking(_TN_BOX, _tn_stores(), hex_across_m=1000.0)
+    raster = render_remoteness_png(ranking, tmp_path / "tn.png", px_per_hex=6)
+    lat_min, lon_min, lat_max, lon_max = raster.image_bounds_latlon
+
+    # True image edges in EPSG:3857: the vertices' 3857 bbox (what the figure
+    # xlim/ylim span, per the pinned "image covers the hex-vertex bounds"
+    # contract).
+    verts = hex_vertices_m(ranking.centers_m, ranking.hex_across_m)
+    vx, vy = _TO_3857.transform(verts[..., 0].ravel(), verts[..., 1].ravel())
+    vx = np.asarray(vx, dtype=np.float64)
+    vy = np.asarray(vy, dtype=np.float64)
+    xmin, xmax = float(vx.min()), float(vx.max())
+    ymin, ymax = float(vy.min()), float(vy.max())
+
+    # The 512 px floor must NOT engage at state scale (strict 6 px/hex), and
+    # the PNG must stay under the 6 MB budget.
+    data = raster.path.read_bytes()
+    w, h = struct.unpack(">II", data[16:24])
+    assert w > 4000 and h > 900, (w, h)
+    assert len(data) < 6 * 1024 * 1024
+
+    # >=50 sampled hex centers across the whole state.
+    step = max(1, ranking.ranks // 60)
+    sample_idx = np.arange(0, ranking.ranks, step)[:60]
+    assert len(sample_idx) >= 50
+    px, py = _TO_3857.transform(
+        ranking.centers_m[sample_idx, 0], ranking.centers_m[sample_idx, 1]
+    )
+    px = np.asarray(px, dtype=np.float64)
+    py = np.asarray(py, dtype=np.float64)
+    fx = (px - xmin) / (xmax - xmin)         # pixel fraction across the PNG
+    fy = (py - ymin) / (ymax - ymin)         # pixel fraction down the PNG
+
+    # Where Leaflet draws each pixel fraction: linear in x and linear in
+    # Mercator-y through the *declared* corner lat/lon.
+    drawn_lon = lon_min + fx * (lon_max - lon_min)
+    y_lo = float(_WGS_TO_MERC.transform(lon_min, lat_min)[1])
+    y_hi = float(_WGS_TO_MERC.transform(lon_max, lat_max)[1])
+    drawn_y = y_lo + fy * (y_hi - y_lo)
+    drawn_lat = _MERC_TO_WGS.transform(np.zeros_like(drawn_y), drawn_y)[1]
+    drawn_x, drawn_y_check = _WGS_TO_MERC.transform(drawn_lon, drawn_lat)
+
+    err_m = np.hypot(drawn_x - px, drawn_y_check - py)
+    assert float(err_m.max()) <= 15.0, (
+        f"state-scale 3857 registration error up to {float(err_m.max()):.1f} m "
+        f"(median {float(np.median(err_m)):.1f} m) over {len(sample_idx)} hexes"
+    )
