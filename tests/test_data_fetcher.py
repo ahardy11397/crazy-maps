@@ -348,12 +348,14 @@ def test_enrich_failure_is_graceful_and_not_cached(tmp_path):
     assert not cache_file.exists()  # nothing successful to write -> no cache
 
 
-def test_enrich_refresh_regeocodes_cached_incomplete_store(tmp_path):
-    # refresh=True ignores the existing cache: an incomplete store already
-    # present in the cache file is geocoded again and its fresh value wins.
+def test_enrich_refresh_reuses_cached_incomplete_store(tmp_path):
+    # Spec 5.4 (controller ruling): --refresh does NOT discard geocoded
+    # addresses. The on-disk cache is always honored: an incomplete store
+    # whose id is already cached is served from the cache and the client
+    # is never called, even with refresh=True.
     cache_file = tmp_path / "store_addresses.json"
     cache_file.write_text(
-        json.dumps({"version": 1, "addresses": {"node/3": "12 Stale Rd, Stale City, TN"}}),
+        json.dumps({"version": 1, "addresses": {"node/3": "12 Cached Rd, Cached City, TN"}}),
         encoding="utf-8",
     )
     incomplete = _store("node/3", 35.1, -86.1)
@@ -364,39 +366,135 @@ def test_enrich_refresh_regeocodes_cached_incomplete_store(tmp_path):
 
     result = enrich_store_addresses([incomplete], cache_file, refresh=True, client=fake)
 
-    assert fake.calls == [(incomplete.lat, incomplete.lon)]   # cached entry was NOT reused
-    assert result["node/3"] == "45 Fresh Rd, Fresh City, TN"  # fresh geocode displayed
+    assert fake.calls == []   # cached id was NOT re-geocoded
+    assert result["node/3"] == "12 Cached Rd, Cached City, TN"  # cache honored
     cache = json.loads(cache_file.read_text())
-    assert cache["addresses"]["node/3"] == "45 Fresh Rd, Fresh City, TN"  # new wins on file
+    # Cache untouched: nothing new was geocoded, so no write (and no loss).
+    assert cache["addresses"] == {"node/3": "12 Cached Rd, Cached City, TN"}
 
 
-def test_enrich_refresh_write_preserves_prior_entries_and_new_wins(tmp_path):
-    # Refresh write-back must not discard previously geocoded addresses
-    # (spec 5.4): a prior entry for a store not looked up this run survives,
-    # and a re-geocoded id overwrites its stale value.
+def test_enrich_refresh_geocodes_only_new_ids_and_preserves_cache(tmp_path):
+    # Spec 5.4: after a refresh, enrichment runs only for store ids missing
+    # from the address cache ("new stores only"): the cached incomplete id
+    # is reused without a network call, a genuinely new incomplete id is
+    # geocoded and cached, and no existing entry is ever lost.
     cache_file = tmp_path / "store_addresses.json"
     cache_file.write_text(
-        json.dumps({"version": 1, "addresses": {"node/3": "12 Stale Rd, Stale City, TN",
+        json.dumps({"version": 1, "addresses": {"node/3": "12 Cached Rd, Cached City, TN",
                                                 "node/7": "42 Old Ave, Kept City, TN"}}),
         encoding="utf-8",
     )
-    regcoded = _store("node/3", 35.1, -86.1)
-    prior_entry_store = _store("node/7", 35.8, -86.8, city="Kept City",
-                               street="Kept Ln", state="TN", housenumber="9")
+    cached_incomplete = _store("node/3", 35.1, -86.1)
+    prior_entry_store = _store("node/7", 35.2, -86.2)
+    new_incomplete = _store("node/8", 35.8, -86.8)
     fake = _FakeNominatimClient(
-        responses={(35.1, -86.1): {"road": "Fresh Rd", "house_number": "45",
+        responses={(35.8, -86.8): {"road": "Fresh Rd", "house_number": "45",
                                    "city": "Fresh City", "state": "TN"}},
     )
 
-    result = enrich_store_addresses([regcoded, prior_entry_store], cache_file, refresh=True, client=fake)
+    result = enrich_store_addresses(
+        [cached_incomplete, prior_entry_store, new_incomplete],
+        cache_file, refresh=True, client=fake,
+    )
 
-    assert fake.calls == [(regcoded.lat, regcoded.lon)]          # only the incomplete store looked up
-    assert result["node/7"] == "9 Kept Ln, Kept City, TN"            # complete -> own fields, cache ignored
+    assert fake.calls == [(new_incomplete.lat, new_incomplete.lon)]  # only the new id geocoded
+    assert result["node/3"] == "12 Cached Rd, Cached City, TN"       # cache honored
+    assert result["node/7"] == "42 Old Ave, Kept City, TN"           # prior cached entry reused
+    assert result["node/8"] == "45 Fresh Rd, Fresh City, TN"         # new id geocoded
     cache = json.loads(cache_file.read_text())
     assert cache["addresses"] == {
-        "node/3": "45 Fresh Rd, Fresh City, TN",   # fresh re-geocode persisted
-        "node/7": "42 Old Ave, Kept City, TN",     # prior entry survived untouched
+        "node/3": "12 Cached Rd, Cached City, TN",   # existing entry intact
+        "node/7": "42 Old Ave, Kept City, TN",       # existing entry intact
+        "node/8": "45 Fresh Rd, Fresh City, TN",     # new geocode persisted
     }
+
+
+class _AlwaysFailingClient:
+    """Fake that raises on every reverse() call and counts the attempts."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def reverse(self, lat, lon):
+        self.calls += 1
+        raise RuntimeError("nominatim unreachable")
+
+
+def test_enrich_circuit_breaker_stops_after_three_consecutive_failures(tmp_path):
+    # Offline/blocked Nominatim: an always-failing fake gets exactly 3
+    # attempted calls (ENRICH_MAX_CONSECUTIVE_FAILURES = 3) and then the
+    # breaker stops the loop; nothing raises, nothing is returned, and no
+    # cache file full of failure entries is created.
+    cache_file = tmp_path / "store_addresses.json"
+    stores = [_store(f"node/{i}", 35.0 + i * 0.01, -86.0 - i * 0.01) for i in range(10)]
+    fake = _AlwaysFailingClient()
+
+    result = enrich_store_addresses(stores, cache_file, client=fake)
+
+    assert fake.calls == 3   # stopped early, not one attempt per store
+    assert result == {}
+    assert not cache_file.exists()
+
+
+def test_enrich_breaker_stops_negatively_but_keeps_successes(tmp_path):
+    # Successes reset the consecutive-failure counter: ok, fail, fail, ok,
+    # fail, fail, fail -> trips on the 3rd consecutive failure.
+    # The returned dict and the cache keep the successes; stores after the
+    # trip are never attempted.
+    cache_file = tmp_path / "store_addresses.json"
+    coords = [(35.0 + i * 0.01, -86.0 - i * 0.01) for i in range(10)]
+    stores = [_store(f"node/{i}", *coords[i]) for i in range(10)]
+    fake = _FakeNominatimClient(
+        responses={coords[0]: {"road": "Rd0", "house_number": "1", "city": "C0", "state": "TN"},
+                   coords[3]: {"road": "Rd3", "house_number": "4", "city": "C3", "state": "TN"}},
+        raise_for=[coords[1], coords[2], coords[4], coords[5], coords[6]],
+    )
+    # coords 7..9 would also fail (unknown -> None), but must never be attempted.
+
+    result = enrich_store_addresses(stores, cache_file, client=fake)
+
+    assert fake.calls == coords[:7]  # stops after the 3rd consecutive failure
+    assert result == {
+        "node/0": "1 Rd0, C0, TN",
+        "node/3": "4 Rd3, C3, TN",
+    }
+    cache = json.loads(cache_file.read_text())
+    assert cache["addresses"] == {
+        "node/0": "1 Rd0, C0, TN",
+        "node/3": "4 Rd3, C3, TN",
+    }
+
+
+def test_enrich_incremental_persist_keeps_successes_when_breaker_trips(tmp_path):
+    # ENRICH_PERSIST_EVERY = 25: after 25 successful geocodes the merged
+    # cache is already on disk. Later persistent failures trip the breaker,
+    # yet the first batch of successes survives on disk, merged with the
+    # pre-existing entries (nothing lost).
+    cache_file = tmp_path / "store_addresses.json"
+    cache_file.write_text(
+        json.dumps({"version": 1, "addresses": {"way/7": "9 Prior Ln, Prior City, TN"}}),
+        encoding="utf-8",
+    )
+    prior_entry_store = _store("way/7", 35.9, -86.9, city="Prior City",
+                               street="Prior Ln", state="TN", housenumber="9")
+    coords = [(35.0 + i * 0.01, -86.0 - i * 0.01) for i in range(28)]
+    stores = [prior_entry_store] + [_store(f"node/{i}", *coords[i]) for i in range(28)]
+    responses = {
+        coords[i]: {"road": f"Rd{i}", "house_number": str(i), "city": f"C{i}", "state": "TN"}
+        for i in range(25)
+    }
+    fake = _FakeNominatimClient(responses=responses, raise_for=coords[25:])
+
+    result = enrich_store_addresses(stores, cache_file, client=fake)
+
+    assert fake.calls == coords  # 25 successes, then 3 consecutive failures trip the breaker
+    assert "way/7" in result
+    assert [f"node/{i}" for i in range(25) if f"node/{i}" not in result] == []
+    cache = json.loads(cache_file.read_text())
+    assert cache["addresses"]["way/7"] == "9 Prior Ln, Prior City, TN"  # prior entry merged
+    for i in range(25):
+        assert cache["addresses"][f"node/{i}"] == f"{i} Rd{i}, C{i}, TN"
+    assert "node/25" not in cache["addresses"]  # failures never cached
 
 
 def test_enrich_display_composition_order(tmp_path):

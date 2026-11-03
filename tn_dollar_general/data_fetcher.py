@@ -21,6 +21,27 @@ DEFAULT_BBOX = (34.5, -90.9, 37.2, -81.0)
 
 DEFAULT_USER_AGENT = "CrazyMapsDollarGeneralFinder/1.0 (https://github.com/crazy-maps)"
 
+# Address-enrichment circuit breaker (spec 5.2: tolerate complete failure
+# gracefully): stop geocoding after this many *consecutive* failed reverse
+# attempts (raised exception or falsy response). Fragment of the rationale:
+# the key-less Nominatim endpoint must stay under 1 req/s, and when it is
+# unreachable/blocked each attempt can hang for up to the 30 s client
+# timeout -- without the breaker a first offline rebuild over ~500-900
+# incomplete stores would appear to hang for hours. After the breaker trips
+# the remaining incomplete stores are left un-attempted; they retry
+# naturally on a later build (failed ids are never cached) and the
+# successes collected so far are still returned and persisted. A successful
+# geocode resets the counter.
+ENRICH_MAX_CONSECUTIVE_FAILURES = 3
+
+# Incremental persistence (spec 5.2): write the merged address cache to
+# disk after this many successful geocodes, so a Ctrl-C/crash/breaker trip
+# during a first run keeps the addresses already fetched.
+ENRICH_PERSIST_EVERY = 25
+
+# Log enrichment loop progress at INFO every this many stores processed.
+ENRICH_PROGRESS_EVERY = 25
+
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
@@ -431,6 +452,42 @@ def _join_address_parts(first_part: str, city: str | None, state: str | None) ->
     return ", ".join(parts)
 
 
+def _persist_address_cache(cache_path: Path, new_entries: dict[str, str]) -> None:
+    """Merge ``new_entries`` into the on-disk cache and write the file back.
+
+    Called on every write path (incremental checkpoint or end of run).
+    Merge semantics on ALL write paths (spec 5.4: addresses persist, never
+    discarded): prior on-disk entries are kept and newly geocoded values
+    win on id collision. Never raises: an OSError is logged and swallowed
+    (spec 5.2: tolerate complete failure gracefully).
+    """
+    merged = _load_address_cache(cache_path)
+    merged.update(new_entries)
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps({"version": 1, "addresses": merged}, indent=2), encoding="utf-8"
+        )
+    except OSError as exc:
+        logger.warning("Could not persist address cache %s: %s", cache_path, exc)
+
+
+def _extract_display_address(store: StoreRecord, data: dict) -> str | None:
+    """Compose the display address from a Nominatim reverse payload, or None."""
+    address = data.get("address") or {}
+    first_part = " ".join(
+        part for part in (address.get("house_number"), address.get("road")) if part
+    )
+    city = (
+        address.get("city")
+        or address.get("town")
+        or address.get("village")
+        or address.get("hamlet")
+    )
+    state = address.get("state") or ("TN" if store.in_tn else None)
+    return _join_address_parts(first_part, city, state) or None
+
+
 def enrich_store_addresses(
     stores: list[StoreRecord],
     address_cache_path: Path | str,
@@ -442,68 +499,104 @@ def enrich_store_addresses(
     Stores carrying the complete own-data triple (housenumber+street+city --
     state defaults to "TN" inside TN) are composed without any network call;
     incomplete stores are reverse-geocoded via ``client.reverse(lat, lon)``.
-    Successful geocodes are cached id-keyed in ``address_cache_path``; on
-    every write prior on-disk entries are preserved and newly geocoded
-    values win on id collision (spec 5.4: addresses persist, never
-    discarded). A per-store failure (bad payload, None return or raised
-    exception) is skipped -- never raised and never cached.
-    ``refresh=True`` ignores the existing cache for lookups and re-geocodes
-    every incomplete store.
+
+    The on-disk cache is ALWAYS loaded and honored: an incomplete store
+    whose id already has a cached address is served from the cache and is
+    not geocoded again; only ids missing from the cache hit the network.
+    Successful geocodes are cached id-keyed in ``address_cache_path``;
+    failed ids are never cached, so they retry naturally on a later build.
+    ``refresh`` is accepted for call-site compatibility but is a no-op for
+    the cache (spec 5.4: the store re-fetch keeps geocoded addresses;
+    enrichment after a refresh runs for new stores only). To re-geocode
+    changed addresses, delete ``data/store_addresses.json``.
+
+    Failure handling (spec 5.2: tolerate complete failure gracefully):
+
+    - Circuit breaker: after ``ENRICH_MAX_CONSECUTIVE_FAILURES``
+      consecutive failed geocode attempts (raised exception or falsy
+      response -- typically Nominatim unreachable, blocked, or rate
+      limited, where each attempt can hang up to the 30 s client
+      timeout), the loop stops attempting further stores, logging a
+      warning. Successes collected so far are still returned and
+      persisted. A successful geocode resets the counter.
+    - Incremental persistence: the merged cache is written to disk every
+      ``ENRICH_PERSIST_EVERY`` successful geocodes (and once more at the
+      end if anything new was geocoded), so an interrupted run keeps its
+      work. Writes never raise.
+    - A per-store failure is skipped -- never raised and never cached;
+      loop progress is logged at INFO every ``ENRICH_PROGRESS_EVERY``
+      stores processed.
     """
     if client is None:
         client = HTTPNominatimClient()
     cache_path = Path(address_cache_path)
-    cached = {} if refresh else _load_address_cache(cache_path)
+    cached = _load_address_cache(cache_path)
 
     display: dict[str, str] = {}
     new_entries: dict[str, str] = {}
+    consecutive_failures = 0
+    successes_since_persist = 0
+    processed = 0
+    skipped = 0
 
     for store in stores:
+        processed += 1
         if store.id in cached:
             display[store.id] = cached[store.id]
+            skipped += 1
             continue
         if store.housenumber and store.street and store.city:
             state = store.state or ("TN" if store.in_tn else None)
             first_part = " ".join(part for part in (store.housenumber, store.street) if part)
             display[store.id] = _join_address_parts(first_part, store.city, state)
+            skipped += 1
             continue
         try:
             data = client.reverse(store.lat, store.lon)
             if not data:
+                consecutive_failures += 1
+                if consecutive_failures >= ENRICH_MAX_CONSECUTIVE_FAILURES:
+                    logger.warning(
+                        "Address enrichment aborting: %d consecutive failed reverse-geocode "
+                        "attempts (Nominatim likely unreachable, blocked, or rate limited). "
+                        "%d/%d stores processed so far; the remaining incomplete stores are "
+                        "left uncached and retry on the next build.",
+                        consecutive_failures, processed, len(stores),
+                    )
+                    break
                 continue
-            address = data.get("address") or {}
-            first_part = " ".join(
-                part for part in (address.get("house_number"), address.get("road")) if part
-            )
-            city = (
-                address.get("city")
-                or address.get("town")
-                or address.get("village")
-                or address.get("hamlet")
-            )
-            state = address.get("state") or ("TN" if store.in_tn else None)
-            text = _join_address_parts(first_part, city, state)
+            text = _extract_display_address(store, data)
             if not text:
                 continue
             display[store.id] = text
             new_entries[store.id] = text
+            consecutive_failures = 0
+            successes_since_persist += 1
+            if successes_since_persist >= ENRICH_PERSIST_EVERY:
+                # Checkpoint: an interrupted run keeps the geocodes it paid for.
+                _persist_address_cache(cache_path, new_entries)
+                successes_since_persist = 0
         except Exception as exc:
+            consecutive_failures += 1
+            if consecutive_failures >= ENRICH_MAX_CONSECUTIVE_FAILURES:
+                logger.warning(
+                    "Address enrichment aborting: %d consecutive failed reverse-geocode "
+                    "attempts (Nominatim likely unreachable, blocked, or rate limited). "
+                    "%d/%d stores processed so far; the remaining incomplete stores are "
+                    "left uncached and retry on the next build.",
+                    consecutive_failures, processed, len(stores),
+                )
+                break
             logger.warning("Address enrichment failed for %s: %s", store.id, exc)
             continue
+        if processed % ENRICH_PROGRESS_EVERY == 0:
+            logger.info(
+                "Address enrichment progress: %d/%d stores processed "
+                "(%d geocoded, %d from cache/own data)",
+                processed, len(stores), len(new_entries), skipped,
+            )
 
     if new_entries:
-        # Merge semantics on ALL write paths (spec 5.4: addresses persist,
-        # never discarded): prior on-disk entries are kept and newly
-        # geocoded values win on id collision (a refresh re-geocode must
-        # overwrite its stale cached value).
-        merged = _load_address_cache(cache_path)
-        merged.update(new_entries)
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(
-                json.dumps({"version": 1, "addresses": merged}, indent=2), encoding="utf-8"
-            )
-        except OSError as exc:
-            logger.warning("Could not persist address cache %s: %s", cache_path, exc)
+        _persist_address_cache(cache_path, new_entries)
 
     return display
