@@ -240,12 +240,18 @@ def _store_display_string(store: StoreRecord, address: str | None) -> str:
     ``address`` (the Task 2 enrichment value) wins when not None/empty; else
     the store's own ``housenumber+street, city, state`` triple ("TN" for
     in-TN stores without a state); else the plain lat/lon coordinate pair.
-    The returned string is NOT escaped yet — callers route it through
-    :func:`_rail_escape` before it reaches the payload.
+    A store with no street part AND no city falls straight to the coordinate
+    pair even when a (possibly defaulted) state is present — the triple would
+    render a bare "TN" and spec §5.2 wants an addressless card to show
+    coordinates. The returned string is NOT escaped yet — callers route it
+    through :func:`_rail_escape` before it reaches the payload.
     """
     if address:
         return address
     first_part = " ".join(part for part in (store.housenumber, store.street) if part)
+    if not first_part and not store.city:
+        # Bare state-only composition ("TN") is not a display address.
+        return f"{store.lat:.5f}, {store.lon:.5f}"
     state = store.state or ("TN" if store.in_tn else None)
     display = ", ".join(part for part in (first_part, store.city, state) if part)
     if not display:
@@ -563,8 +569,15 @@ def _add_rail_and_data_block(
     hex_ranking: HexRanking,
     stores: list[StoreRecord],
     store_display: dict[str, str] | None,
+    tn_geom: shapely.Geometry,
 ) -> None:
     """Bake the pinned JSON data block + side rail UI/click JS onto the map.
+
+    ``tn_geom`` (the same state polygon the ranking was built on) is passed
+    to :func:`build_click_table` so bucket cells off-state carry the
+    sentinel: a click inside the state snaps to the nearest ranked hex
+    (border-gap snap), a click entirely off-state leaves the rail untouched
+    (spec §5.3).
 
     All store text (name, id, display address) passes through
     :func:`_rail_escape` before serialization: the payload is the only source,
@@ -573,7 +586,7 @@ def _add_rail_and_data_block(
     map_id = m.get_name()
     stores = list(stores)
 
-    click_table = build_click_table(hex_ranking)
+    click_table = build_click_table(hex_ranking, state_geom=tn_geom)
     display_map = {
         s.id: _rail_escape(_store_display_string(s, (store_display or {}).get(s.id)))
         for s in stores
@@ -796,7 +809,7 @@ def build_map(
 
     # 7. Remoteness side rail + baked data block + click JS (ranked builds only)
     if hex_ranking is not None:
-        _add_rail_and_data_block(m, hex_ranking, stores, store_display)
+        _add_rail_and_data_block(m, hex_ranking, stores, store_display, tn_geom)
 
     # 8. Save to HTML
     m.save(str(output_path))

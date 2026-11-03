@@ -63,7 +63,7 @@ Outputs:
 ## Development
 
 ```bash
-uv run pytest -q   # 22 tests: parsing, deduplication, solver, map output, pipeline
+uv run pytest -q   # 62 tests: parsing, deduplication, solver, hex ranking, map output, pipeline
 ```
 
 ## Data sources & attribution

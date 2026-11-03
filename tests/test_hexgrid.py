@@ -1,11 +1,14 @@
 import base64
+import dataclasses
 import json
 import struct
 
 import numpy as np
 import pyproj
+import pytest
 import shapely
 from shapely.geometry import box
+from shapely.prepared import prep
 
 from tn_dollar_general.data_fetcher import StoreRecord
 from tn_dollar_general.geometry import find_furthest_point
@@ -17,6 +20,7 @@ from tn_dollar_general.hexgrid import (
     hex_vertices_m,
     render_remoteness_png,
     _ramp_color,
+    _store_address,
 )
 
 _CLICK_SENTINEL = 0xFFFFFFFF  # pinned "no hex resolves here" bucket value
@@ -78,7 +82,7 @@ def _square_state_and_corner_stores() -> tuple[shapely.Geometry, list[StoreRecor
 
 
 def _tn_stores() -> list[StoreRecord]:
-    """5 stores spread across the full TN-scale box (see ``_TN_BOX``)."""
+    """5 stores spread across the full TN-scale extent (see ``_TN_STATE_POLY``)."""
     return [
         StoreRecord(
             id=str(idx),
@@ -426,9 +430,22 @@ def test_raster_image_bounds_latlon_track_projected_vertices(tmp_path):
 # State-scale overlay registration (Critical C1 regression guard)
 # ---------------------------------------------------------------------------
 
-# TN-shaped box ~8.6 deg lon x ~1.7 deg lat (35.0-36.7 N, -90.3 to -81.7 W),
-# i.e. near the full state extent -> ~150-175k pinned 1000 m hexes.
-_TN_BOX = box(-90.3, 35.0, -81.7, 36.7)
+# TN-shaped synthetic "state": full TN extent (35.0-36.6 N, -90.3 to -81.7 W)
+# with the southeast corner cut off along a slanted border the way the real
+# NC/GA mountain border runs (-81.7, 36.6) -> (-84.3, 35.0). Its area (~11.8
+# deg^2 ~= 117k km^2) is within ~8% of real Tennessee (~109k km^2), so the
+# ~136k-hex ranking built on it matches production scale for the off-state
+# click mask and the data-block size budget; the raster registration test
+# shares it. Asheville (35.6, -82.55) sits south of the slant — inside the
+# clip bbox, outside the state.
+_TN_STATE_POLY = shapely.Polygon(
+    [
+        (-90.3, 35.0),
+        (-90.3, 36.6),
+        (-81.7, 36.62),
+        (-84.32, 35.0),
+    ]
+)
 
 _TN_STORE_LATLONS = [
     (35.1, -90.0),
@@ -443,7 +460,19 @@ _WGS_TO_MERC = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=T
 _MERC_TO_WGS = pyproj.Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 
 
-def test_raster_registers_exactly_in_3857_at_state_scale(tmp_path):
+@pytest.fixture(scope="module")
+def tn_scale_ranking() -> HexRanking:
+    """The ~136k-hex state-scale TN-shaped ranking, built once and shared.
+
+    The pinned 1000 m lattice over the TN-shaped synthetic (within ~8% of
+    real Tennessee's area, so the state-scale budget test matches production
+    scale); a build takes ~0.3 s, so the raster registration, off-state click
+    mask, and data-block size tests all reuse this one instance.
+    """
+    return build_hex_ranking(_TN_STATE_POLY, _tn_stores(), hex_across_m=1000.0)
+
+
+def test_raster_registers_exactly_in_3857_at_state_scale(tmp_path, tn_scale_ranking):
     """The PNG is drawn in EPSG:3857 and its declared bounds register it exactly.
 
     Leaflet draws an ``ImageOverlay`` as an axis-aligned rectangle linear in
@@ -459,7 +488,7 @@ def test_raster_registers_exactly_in_3857_at_state_scale(tmp_path):
     true 3857 image edges, and we then ask where the declared lat/lon
     rectangle (linear in x, linear in Mercator-y) draws that pixel fraction.
     """
-    ranking = build_hex_ranking(_TN_BOX, _tn_stores(), hex_across_m=1000.0)
+    ranking = tn_scale_ranking
     raster = render_remoteness_png(ranking, tmp_path / "tn.png", px_per_hex=6)
     lat_min, lon_min, lat_max, lon_max = raster.image_bounds_latlon
 
@@ -506,3 +535,231 @@ def test_raster_registers_exactly_in_3857_at_state_scale(tmp_path):
         f"state-scale 3857 registration error up to {float(err_m.max()):.1f} m "
         f"(median {float(np.median(err_m)):.1f} m) over {len(sample_idx)} hexes"
     )
+
+
+# ---------------------------------------------------------------------------
+# Off-state click mask (Important I1, spec §5.3)
+# ---------------------------------------------------------------------------
+
+
+def test_click_table_state_mask_sends_offstate_bbox_cells_to_sentinel():
+    """``state_geom`` restricts snapping to bucket cells inside the state.
+
+    An L-shaped synthetic state: bucket-cell centers in the cut-out notch lie
+    inside the hex centers' clip bbox yet outside the state. With
+    ``state_geom`` they must carry the sentinel (a click there leaves the rail
+    untouched); with ``state_geom=None`` the old behavior — snap to the
+    geometrically nearest hex, however far — is unchanged. A cell clearly
+    inside the state still resolves to the geometrically nearest ranked hex
+    (that resolution IS the spec §5.3 border-gap snap).
+    """
+    minx, miny, maxx, maxy = _SQUARE.bounds
+    splitx = minx + 0.6 * (maxx - minx)   # notch edge (lon), full west arm kept
+    splity = miny + 0.3 * (maxy - miny)   # notch edge (lat), full south arm kept
+    l_state = shapely.Polygon(
+        [
+            (minx, miny),
+            (maxx, miny),
+            (maxx, splity),
+            (splitx, splity),
+            (splitx, maxy),
+            (minx, maxy),
+        ]
+    )
+    ranking = build_hex_ranking(
+        l_state, _square_state_and_corner_stores()[1], hex_across_m=2000.0
+    )
+    cl = ranking.centers_latlon
+    clip_lat_min, clip_lat_max = float(cl[:, 0].min()), float(cl[:, 0].max())
+    clip_lon_min, clip_lon_max = float(cl[:, 1].min()), float(cl[:, 1].max())
+
+    masked = build_click_table(ranking, state_geom=l_state)
+    plain = build_click_table(ranking)
+    assert (
+        masked.lat_cells,
+        masked.lon_cells,
+        masked.cell_deg,
+        masked.lat_min,
+        masked.lon_min,
+    ) == (plain.lat_cells, plain.lon_cells, plain.cell_deg, plain.lat_min, plain.lon_min)
+
+    def cell_of(lat: float, lon: float) -> tuple[int, int, float, float]:
+        i = int(np.floor((lat - masked.lat_min) / masked.cell_deg))
+        j = int(np.floor((lon - masked.lon_min) / masked.cell_deg))
+        return i, j, masked.lat_min + (i + 0.5) * masked.cell_deg, masked.lon_min + (j + 0.5) * masked.cell_deg
+
+    # --- Off-state, in-bbox: a bucket cell in the notch ---------------------
+    notch_lat = 0.5 * (splity + maxy)
+    notch_lon = 0.5 * (splitx + maxx)
+    i, j, cell_lat, cell_lon = cell_of(notch_lat, notch_lon)
+    assert 0 <= i < masked.lat_cells and 0 <= j < masked.lon_cells
+    assert clip_lat_min <= cell_lat <= clip_lat_max
+    assert clip_lon_min <= cell_lon <= clip_lon_max
+    assert not shapely.contains_xy(l_state, cell_lon, cell_lat)  # yes, off-state
+    assert int(masked.idx[i * masked.lon_cells + j]) == _CLICK_SENTINEL
+    # Old behavior (state_geom=None): the very same cell snapped to a real hex.
+    plain_idx = int(plain.idx[i * plain.lon_cells + j])
+    assert plain_idx != _CLICK_SENTINEL and plain_idx < ranking.ranks
+
+    # --- In-state: a cell deep inside the west arm still snaps --------------
+    in_lat = miny + 0.11 * (maxy - miny)
+    in_lon = minx + 0.25 * (maxx - minx)
+    i2, j2, cell_lat2, cell_lon2 = cell_of(in_lat, in_lon)
+    assert shapely.contains_xy(l_state, cell_lon2, cell_lat2)
+    resolved = int(masked.idx[i2 * masked.lon_cells + j2])
+    assert resolved != _CLICK_SENTINEL and resolved < ranking.ranks
+    # It is the geometrically nearest hex to the cell center.
+    d = np.hypot(cl[:, 0] - cell_lat2, cl[:, 1] - cell_lon2)
+    assert resolved == int(np.argmin(d))
+    assert int(plain.idx[i2 * plain.lon_cells + j2]) == resolved  # mask is a no-op inside
+
+    # --- Bulk invariant: exactly the off-state cells carry the sentinel ----
+    state_cell_lats = masked.lat_min + (np.arange(masked.lat_cells) + 0.5) * masked.cell_deg
+    state_cell_lons = masked.lon_min + (np.arange(masked.lon_cells) + 0.5) * masked.cell_deg
+    lat_grid, lon_grid = np.meshgrid(state_cell_lats, state_cell_lons, indexing="ij")
+    inside_state = shapely.contains_xy(l_state, lon_grid.ravel(), lat_grid.ravel())
+    beyond = (
+        (state_cell_lats > clip_lat_max) | (state_cell_lats < clip_lat_min)
+    )[:, None] | ((state_cell_lons > clip_lon_max) | (state_cell_lons < clip_lon_min))[None, :]
+    expected_sentinel = (~inside_state) | beyond.ravel()
+    assert np.array_equal(masked.idx == _CLICK_SENTINEL, expected_sentinel)
+    # Unmasked table is untouched: only the ragged beyond-clip cells.
+    assert np.array_equal(plain.idx == _CLICK_SENTINEL, beyond.ravel())
+
+
+def test_click_table_state_mask_offstate_cells_at_tn_scale(tn_scale_ranking):
+    """Spec §5.3 at state scale: an Asheville-like corner click must NOT open
+    a TN hex card tens of kilometres away.
+
+    Clicking inside the state with no ranked hex underneath snaps to the
+    nearest ranked hex (border-gap snap), but cells whose center is outside
+    the state carry the sentinel. On the pre-fix code every cell inside the
+    ~8.7 deg x 1.7 deg center bbox snapped (100% of ~40k off-state cells).
+    """
+    ranking = tn_scale_ranking
+    cl = ranking.centers_latlon
+    clip_lat_min, clip_lat_max = float(cl[:, 0].min()), float(cl[:, 0].max())
+    clip_lon_min, clip_lon_max = float(cl[:, 1].min()), float(cl[:, 1].max())
+
+    masked = build_click_table(ranking, state_geom=_TN_STATE_POLY)
+    plain = build_click_table(ranking)
+
+    # Asheville sits inside the clip bbox but clearly outside TN's slanted
+    # eastern border -> sentinel with the mask, a (wrong) snap without it.
+    asheville_lat, asheville_lon = 35.595, -82.551
+    assert clip_lat_min < asheville_lat < clip_lat_max
+    assert clip_lon_min < asheville_lon < clip_lon_max
+    assert not shapely.contains_xy(_TN_STATE_POLY, asheville_lon, asheville_lat)
+    i = int(np.floor((asheville_lat - masked.lat_min) / masked.cell_deg))
+    j = int(np.floor((asheville_lon - masked.lon_min) / masked.cell_deg))
+    assert masked.idx[i * masked.lon_cells + j] == _CLICK_SENTINEL
+    plain_idx = int(plain.idx[i * plain.lon_cells + j])
+    assert plain_idx != _CLICK_SENTINEL and plain_idx < ranking.ranks  # pre-fix bug
+
+    # An in-state cell resolves identically with and without the mask.
+    tn_lat, tn_lon = 35.86, -86.35
+    assert shapely.contains_xy(_TN_STATE_POLY, tn_lon, tn_lat)
+    i2 = int(np.floor((tn_lat - masked.lat_min) / masked.cell_deg))
+    j2 = int(np.floor((tn_lon - masked.lon_min) / masked.cell_deg))
+    resolved = int(masked.idx[i2 * masked.lon_cells + j2])
+    assert resolved != _CLICK_SENTINEL and resolved < ranking.ranks
+    assert resolved == int(plain.idx[i2 * plain.lon_cells + j2])
+
+    # Bulk: exactly the off-state (or beyond-clip) cells carry the sentinel.
+    state_cell_lats = masked.lat_min + (np.arange(masked.lat_cells) + 0.5) * masked.cell_deg
+    state_cell_lons = masked.lon_min + (np.arange(masked.lon_cells) + 0.5) * masked.cell_deg
+    lat_grid, lon_grid = np.meshgrid(state_cell_lats, state_cell_lons, indexing="ij")
+    inside_state = shapely.contains_xy(_TN_STATE_POLY, lon_grid.ravel(), lat_grid.ravel())
+    beyond = (
+        (state_cell_lats > clip_lat_max) | (state_cell_lats < clip_lat_min)
+    )[:, None] | ((state_cell_lons > clip_lon_max) | (state_cell_lons < clip_lon_min))[None, :]
+    expected_sentinel = (~inside_state) | beyond.ravel()
+    assert np.array_equal(masked.idx == _CLICK_SENTINEL, expected_sentinel)
+    sent_fraction = float(expected_sentinel.mean())
+    assert sent_fraction > 0.10  # a real chunk of the bbox is off-state
+    assert sent_fraction < 0.90  # most of the state still snaps
+    assert np.array_equal(plain.idx == _CLICK_SENTINEL, beyond.ravel())
+
+
+# ---------------------------------------------------------------------------
+# Data-block size budget at production scale (Important I2)
+# ---------------------------------------------------------------------------
+
+
+def test_state_scale_data_block_within_amended_size_budget(tn_scale_ranking):
+    """Guard for the controller-amended size budget at state scale.
+
+    The plan's <= 1.5 MB budget is arithmetically impossible under its own
+    pinned schema: 14 B/hex per-hex arrays (~2.35 MB base64) plus the pinned
+    0.005 deg click table (~3.1 MB base64) measure ~5.0-5.5 MB at state scale
+    (~170k hexes). Ruling (binding, recorded in the ledger): the acceptance
+    goal is fast open/click (measured 41 ms decode, 26 MB heap); the budgets
+    were amended to data block <= 6.0 MB and HTML <= 7.5 MB. The data-block
+    half is enforced here; compression / analytic lookup stay off the table
+    unless a real perf regression appears.
+    """
+    ranking = tn_scale_ranking
+    click_table = build_click_table(ranking, state_geom=_TN_STATE_POLY)
+    block = encode_data_block(ranking, click_table, store_display={}, stores=_tn_stores())
+    payload = json.dumps(block, separators=(",", ":"), sort_keys=True)
+    assert len(payload) <= 6_000_000, (
+        f"state-scale data block is {len(payload)} bytes, over the amended "
+        "6.0 MB budget (controller ruling; see ledger)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Equal-distance tie-break (Minor B, spec §5.1/§6.1)
+# ---------------------------------------------------------------------------
+
+
+def test_equal_distance_ties_break_by_ascending_hex_id_and_store_order():
+    """Equal planar distances tie stably: ranks adjacent, ascending hex id,
+    independent of input store order.
+
+    The symmetric square fixture (4 corners + 4 edge-midpoint stores) exhibits
+    a genuine bit-exact duplicate in its planar distances; grouping by exact
+    duplicate value pins the ``np.lexsort((hex_ids, -distance))`` tie-break.
+    """
+    geom, stores = _square_state_and_corner_stores()
+    ranking = build_hex_ranking(geom, stores)
+    values, counts = np.unique(ranking.distance_meters, return_counts=True)
+    tie_values = values[counts > 1]
+    assert len(tie_values) >= 1, "fixture must contain an exact distance tie"
+    for value in tie_values:
+        hex_ids = np.flatnonzero(ranking.distance_meters == value)
+        ranks = ranking.rank[hex_ids]
+        # Ranks adjacent (one contiguous integer range) ...
+        assert np.array_equal(np.sort(ranks), np.arange(ranks.min(), ranks.min() + len(hex_ids)))
+        # ... ordered ascending by hex index (stable tie, spec §5.1/§6.1).
+        assert np.array_equal(ranks, np.sort(ranks))
+
+    # The order must not depend on the input store order: same distances over
+    # the same hexes, same tie-break -> identical rank arrays.
+    reversed_ranking = build_hex_ranking(geom, list(reversed(stores)))
+    assert np.array_equal(ranking.rank, reversed_ranking.rank)
+    assert np.allclose(ranking.distance_meters, reversed_ranking.distance_meters)
+
+
+# ---------------------------------------------------------------------------
+# Addressless-store display fallback (Minor A, spec §5.2)
+# ---------------------------------------------------------------------------
+
+
+def test_store_address_addressless_in_tn_uses_coordinate_fallback():
+    """An in-TN store with no street, housenumber, city, or state must show
+    the coordinate pair, not a bare "TN" (spec §5.2); a city-only store keeps
+    the pinned composition when a city is present."""
+    bare = StoreRecord(
+        id="1", name="DG #1", lat=35.11, lon=-86.22,
+        city=None, street=None, state=None, in_tn=True,
+    )
+    expected = f"{bare.lat:.5f}, {bare.lon:.5f}"
+    assert _store_address(bare, {}) == expected
+    assert _store_address(bare, None) == expected
+
+    city_only = dataclasses.replace(bare, city="Franklin")
+    assert _store_address(city_only, {}) == "Franklin, TN"
+    # Street-only keeps the street + default-state composition.
+    street_only = dataclasses.replace(bare, street="Main St")
+    assert _store_address(street_only, {}) == "Main St, TN"

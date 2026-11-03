@@ -20,10 +20,13 @@ All heavy work is vectorized: one projection pass for centers + stores, a single
 
 Click lookup / data block: ``build_click_table`` snaps a coarse (0.005 deg)
 bucket grid over the hex centers' clip extent to the geometrically nearest hex
-center (0xFFFFFFFF sentinel for cells beyond the clip bounds), and
-``encode_data_block`` packs the ranking, quantized centers, click table and
-store display strings into the little-endian base64 JSON block the JS decoder
-consumes.
+center (0xFFFFFFFF sentinel for cells beyond the clip bounds — and, when a
+``state_geom`` is given, for every cell whose center lies outside the state,
+per spec §5.3: a click inside the state still snaps to the nearest ranked hex
+(border-gap snap), but a click entirely off-state leaves the rail
+untouched), and ``encode_data_block`` packs the ranking, quantized centers,
+click table and store display strings into the little-endian base64 JSON block
+the JS decoder consumes.
 """
 
 from __future__ import annotations
@@ -215,8 +218,11 @@ class ClickTable:
     ``[lon_min + j*cell_deg, lon_min + (j+1)*cell_deg)`` and its value is
     ``idx[i * lon_cells + j]`` — the hex index of the geometrically nearest hex
     center, or :data:`_CLICK_SENTINEL` (0xFFFFFFFF) when the cell's own center
-    lies beyond the clip bounds. A click outside the grid resolves to the
-    sentinel too (checked by the JS decoder's cell math).
+    lies beyond the clip bounds, or — when ``state_geom`` was given to
+    :func:`build_click_table` — when its center lies outside the state
+    (spec §5.3: clicks entirely off-state leave the rail untouched). A click
+    outside the grid resolves to the sentinel too (checked by the JS decoder's
+    cell math).
     """
 
     cell_deg: float                 # 0.005 (pinned default)
@@ -227,7 +233,11 @@ class ClickTable:
     idx: np.ndarray                 # uint32 (lat_cells*lon_cells,)
 
 
-def build_click_table(hex_ranking: HexRanking, cell_deg: float = 0.005) -> ClickTable:
+def build_click_table(
+    hex_ranking: HexRanking,
+    cell_deg: float = 0.005,
+    state_geom: shapely.Geometry | None = None,
+) -> ClickTable:
     """Snap every bucket cell to the geometrically nearest hex center.
 
     The grid covers the clip extent (the hex centers' min/max lat/lon) in
@@ -236,6 +246,16 @@ def build_click_table(hex_ranking: HexRanking, cell_deg: float = 0.005) -> Click
     is beyond the clip bounds carry the sentinel instead of a hex index.
     Distance is the WGS84 small-angle approximation: degrees with longitude
     scaled by ``cos(mid-lat)``, accurate enough at ~0.5 km cells.
+
+    ``state_geom``: when given, every bucket cell whose **center** lies
+    outside that geometry also carries the sentinel. A click inside the state
+    with no ranked hex underneath still snaps to the geometrically nearest
+    ranked hex — that resolution IS the border-gap snap (spec §5.3) — but a
+    click entirely off-state (e.g. Asheville within TN's clip bbox) must leave
+    the rail untouched, so it must not resolve to a hex. The mask is shapely's
+    prepared, fully vectorized point-in-polygon over the whole cell-center
+    grid (no Python loop; ~5.9e5 cells at production scale). Passing ``None``
+    keeps the pre-mask behavior exactly.
     """
     if cell_deg <= 0:
         raise ValueError(f"cell_deg must be positive, got {cell_deg}")
@@ -270,6 +290,21 @@ def build_click_table(hex_ranking: HexRanking, cell_deg: float = 0.005) -> Click
     )
     idx[beyond] = _CLICK_SENTINEL
 
+    if state_geom is not None:
+        # Off-state mask (spec §5.3 off-state owner call): one vectorized
+        # prepared point-in-polygon pass over the full cell-center grid —
+        # same pattern ``build_hex_ranking`` uses for the lattice. (shapely's
+        # ``contains_xy`` rejects prepared geometries, so the prepared
+        # contains-over-points form is used instead; both are vectorized.)
+        lat_grid, lon_grid = np.meshgrid(cell_lats, cell_lons, indexing="ij")
+        inside_state = np.asarray(
+            prep(state_geom).contains(
+                shapely.points(lon_grid.ravel(), lat_grid.ravel())
+            ),
+            dtype=bool,
+        )
+        idx[~inside_state] = _CLICK_SENTINEL
+
     return ClickTable(
         cell_deg=float(cell_deg),
         lat_min=lat_min,
@@ -300,13 +335,19 @@ def _store_address(store: StoreRecord, store_display: dict[str, str]) -> str:
     Task 2's enrichment value wins when present and non-empty; otherwise the
     store's own housenumber+street, city, state triple is joined ("TN" for
     in-TN stores without a state); otherwise the plain lat/lon coordinate
-    pair is the fallback for store-less/empty entries.
+    pair is the fallback for store-less/empty entries. A store with no street
+    part AND no city falls straight to the coordinate pair even when a
+    (possibly defaulted) state is present — the triple would render a bare
+    "TN" and spec §5.2 wants an addressless card to show coordinates.
     """
     display = store_display.get(store.id, "") if store_display else ""
     if not display:
         first_part = " ".join(part for part in (store.housenumber, store.street) if part)
-        state = store.state or ("TN" if store.in_tn else None)
-        display = ", ".join(part for part in (first_part, store.city, state) if part)
+        if not first_part and not store.city:
+            display = ""  # bare state-only triple is not a display address
+        else:
+            state = store.state or ("TN" if store.in_tn else None)
+            display = ", ".join(part for part in (first_part, store.city, state) if part)
     if not display:
         display = f"{store.lat:.5f}, {store.lon:.5f}"
     return display

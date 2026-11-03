@@ -407,6 +407,25 @@ def _extract_block(html_text: str) -> dict:
     return json.loads(html_text[start:end])
 
 
+# --- Minor A: addressless in-TN stores fall back to coordinates (spec §5.2) --
+
+
+def test_store_display_string_addressless_in_tn_uses_coordinate_fallback(stores):
+    """An in-TN store with no street, housenumber, city, or state must show
+    the coordinate pair — not a bare "TN"; a city-only store keeps the
+    pinned composition (spec §5.2)."""
+    bare = dataclasses.replace(
+        stores[0], housenumber=None, street=None, city=None, state=None
+    )
+    expected = f"{bare.lat:.5f}, {bare.lon:.5f}"
+    assert _store_display_string(bare, None) == expected
+    assert _store_display_string(bare, {}) == expected
+
+    city_only = dataclasses.replace(bare, city="Franklin")
+    assert _store_display_string(city_only, None) == "Franklin, TN"
+    assert _store_display_string(city_only, {}) == "Franklin, TN"
+
+
 def _decode_block(block: dict) -> dict:
     """Mirror the rail JS decoder in Python: parse the base64 LE arrays."""
     n = block["totals"]["hexes"]
