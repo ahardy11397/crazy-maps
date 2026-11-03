@@ -1,21 +1,21 @@
 {
   "main.py": {
-    "mtime": 1793466399.3214047,
-    "seen": 1793467031.5963972,
-    "ast_hash": "9d505b7c41468f6196e4c23a63117b7b",
-    "semantic_hash": "9d505b7c41468f6196e4c23a63117b7b"
+    "mtime": 1793674862.6475468,
+    "seen": 1793679247.1367946,
+    "ast_hash": "11c4253d0666f5b10c0987060821b81d",
+    "semantic_hash": "11c4253d0666f5b10c0987060821b81d"
   },
   "pyproject.toml": {
-    "mtime": 1793466399.3214047,
-    "seen": 1793467031.5964022,
-    "ast_hash": "88fe037d8cc06af7d1b4057af1ecd6c6",
-    "semantic_hash": "88fe037d8cc06af7d1b4057af1ecd6c6"
+    "mtime": 1793674862.6475468,
+    "seen": 1793679247.1368017,
+    "ast_hash": "9582908018a09d250ff53f0b93572ca0",
+    "semantic_hash": "9582908018a09d250ff53f0b93572ca0"
   },
   "tests/test_data_fetcher.py": {
-    "mtime": 1793465959.051751,
-    "seen": 1793467031.5964048,
-    "ast_hash": "ef62128b8cb8518a2b7fae220cc81cfc",
-    "semantic_hash": "ef62128b8cb8518a2b7fae220cc81cfc"
+    "mtime": 1793674862.6475468,
+    "seen": 1793679247.1368058,
+    "ast_hash": "d29eac392fd7a288cee740d3591514f5",
+    "semantic_hash": "d29eac392fd7a288cee740d3591514f5"
   },
   "tests/test_geometry.py": {
     "mtime": 1793465831.990225,
@@ -24,10 +24,10 @@
     "semantic_hash": "da37227eddf34e7fff54032c96ac5ec2"
   },
   "tests/test_map_builder.py": {
-    "mtime": 1793466035.0210524,
-    "seen": 1793467031.5964086,
-    "ast_hash": "ab3cfaad421b7dbe6d7a5987114328a5",
-    "semantic_hash": "ab3cfaad421b7dbe6d7a5987114328a5"
+    "mtime": 1793674862.648547,
+    "seen": 1793679247.1368172,
+    "ast_hash": "b47a303e5a54932e86002eeadd8b33cd",
+    "semantic_hash": "b47a303e5a54932e86002eeadd8b33cd"
   },
   "tn_dollar_general/__init__.py": {
     "mtime": 1793316769.1579292,
@@ -36,10 +36,10 @@
     "semantic_hash": "96f68ebf0cf3bc895f4eb5a8c4471bff"
   },
   "tn_dollar_general/data_fetcher.py": {
-    "mtime": 1793465966.756227,
-    "seen": 1793467031.5964117,
-    "ast_hash": "37144ab83d16e8f948bc6c463c662305",
-    "semantic_hash": "37144ab83d16e8f948bc6c463c662305"
+    "mtime": 1793674862.648547,
+    "seen": 1793679247.136823,
+    "ast_hash": "395d9d7d1831371c65d3f278f932227e",
+    "semantic_hash": "395d9d7d1831371c65d3f278f932227e"
   },
   "tn_dollar_general/geometry.py": {
     "mtime": 1793465966.7558143,
@@ -48,16 +48,16 @@
     "semantic_hash": "9013c149c92790b7a39dd63332e6808c"
   },
   "tn_dollar_general/map_builder.py": {
-    "mtime": 1793465843.767275,
-    "seen": 1793467031.5964146,
-    "ast_hash": "c91d3a8e0dffb66ca81774fb19731dba",
-    "semantic_hash": "c91d3a8e0dffb66ca81774fb19731dba"
+    "mtime": 1793674862.648547,
+    "seen": 1793679247.136831,
+    "ast_hash": "e4ea5e71eb89cab9cfe631d8908573e9",
+    "semantic_hash": "e4ea5e71eb89cab9cfe631d8908573e9"
   },
   "README.md": {
-    "mtime": 1793466395.9463928,
-    "seen": 1793467031.596416,
-    "ast_hash": "22bfb06c3a5bf414be1014cd8b6af8b6",
-    "semantic_hash": "22bfb06c3a5bf414be1014cd8b6af8b6"
+    "mtime": 1793674862.6475468,
+    "seen": 1793679247.1368334,
+    "ast_hash": "7ee1b11d07a6d7200a16e41ba3617785",
+    "semantic_hash": "7ee1b11d07a6d7200a16e41ba3617785"
   },
   "docs/superpowers/plans/2026-10-29-tn-dollar-general-map.md": {
     "mtime": 1793305436.6937976,
@@ -70,5 +70,29 @@
     "seen": 1793467031.5964193,
     "ast_hash": "86600e2c71bd26834490ab180f95e7b9",
     "semantic_hash": "86600e2c71bd26834490ab180f95e7b9"
+  },
+  "tests/test_hexgrid.py": {
+    "mtime": 1793674862.6475468,
+    "seen": 1793679247.1368144,
+    "ast_hash": "096fe4f11d6f4f4871d26ff95628c0b9",
+    "semantic_hash": "096fe4f11d6f4f4871d26ff95628c0b9"
+  },
+  "tn_dollar_general/hexgrid.py": {
+    "mtime": 1793674862.648547,
+    "seen": 1793679247.1368282,
+    "ast_hash": "8a97e52056bdfb3554c7915524cd48a2",
+    "semantic_hash": "8a97e52056bdfb3554c7915524cd48a2"
+  },
+  "docs/superpowers/plans/2026-10-31-hex-remoteness-ranking.md": {
+    "mtime": 1793471317.837989,
+    "seen": 1793679247.1368356,
+    "ast_hash": "3387b68b85560287a63e9539d2aa4edd",
+    "semantic_hash": "3387b68b85560287a63e9539d2aa4edd"
+  },
+  "docs/superpowers/specs/2026-10-31-hex-remoteness-ranking-design.md": {
+    "mtime": 1793471147.516601,
+    "seen": 1793679247.136838,
+    "ast_hash": "2e831e423fedbe25ae7479d180ddb22a",
+    "semantic_hash": "2e831e423fedbe25ae7479d180ddb22a"
   }
 }
